@@ -3285,7 +3285,9 @@ struct ProfileDetailView: View {
 
             // Ensure log directory exists (append to existing log, don't truncate)
             let logDir = (syncLogPath as NSString).deletingLastPathComponent
-            try? fileManager.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+            try? fileManager.createDirectory(
+                atPath: logDir, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
 
             // Create file if it doesn't exist
             if !fileManager.fileExists(atPath: syncLogPath) {
@@ -4019,7 +4021,9 @@ struct ProfileDetailView: View {
 
             // Ensure log directory exists
             let logDir = (syncLogPath as NSString).deletingLastPathComponent
-            try? fileManager.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+            try? fileManager.createDirectory(
+                atPath: logDir, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
 
             if !fileManager.fileExists(atPath: syncLogPath) {
                 fileManager.createFile(atPath: syncLogPath, contents: nil)
@@ -4427,7 +4431,9 @@ struct ProfileDetailView: View {
         // Create log directory if needed
         let logDir = (logPath as NSString).deletingLastPathComponent
         if !fileManager.fileExists(atPath: logDir) {
-            try? fileManager.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+            try? fileManager.createDirectory(
+                atPath: logDir, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
         }
 
         // Append to log file

@@ -124,7 +124,8 @@ final class ProfileStore: ObservableObject {
     /// `.profile.json` changes, so pruning is safe with the watcher.
     private func writeProfileFiles() {
         guard (try? FileManager.default.createDirectory(
-            atPath: profilesDirectory, withIntermediateDirectories: true)) != nil else { return }
+            atPath: profilesDirectory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])) != nil else { return }
 
         var writtenFilenames: Set<String> = []
         for profile in profiles {
@@ -157,7 +158,8 @@ final class ProfileStore: ObservableObject {
     nonisolated static func writeProfileFile(_ profile: SyncProfile, in directory: String) -> String? {
         let fm = FileManager.default
         guard (try? fm.createDirectory(
-            atPath: directory, withIntermediateDirectories: true)) != nil else { return nil }
+            atPath: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])) != nil else { return nil }
 
         guard var dict = try? encodeProfileDict(profile) else { return nil }
         // Relative to `directory` (".../profiles"), the schema lives one level

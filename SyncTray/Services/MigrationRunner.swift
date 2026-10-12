@@ -318,7 +318,9 @@ struct MigrationV3BlobToPerProfileFiles: ProfileMigration {
     /// got a file) is OBSERVABLE rather than losing config quietly.
     @discardableResult
     static func writeProfileFiles(from profileDicts: [[String: Any]], to directory: String) throws -> WriteResult {
-        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            atPath: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
 
         var written = 0
         var present = 0

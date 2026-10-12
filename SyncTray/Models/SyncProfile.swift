@@ -169,9 +169,16 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         "\(NSHomeDirectory())/Library/LaunchAgents/com.synctray.sync.\(shortId).plist"
     }
 
+    /// Directory holding every profile's sync log. Created owner-only (0700) — the logs
+    /// name every synced file — and tightened at launch by
+    /// `SyncSetupService.tightenPrivateDirectoriesIfLoose()`.
+    static var logDirectory: String {
+        "\(NSHomeDirectory())/.local/log"
+    }
+
     /// Profile-specific log file
     var logPath: String {
-        "\(NSHomeDirectory())/.local/log/synctray-sync-\(shortId).log"
+        "\(Self.logDirectory)/synctray-sync-\(shortId).log"
     }
 
     /// Profile-specific exclude filter file
