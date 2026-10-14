@@ -8,7 +8,10 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var remotePath: String              // e.g., "Kaiju"
     var localSyncPath: String           // e.g., "/Volumes/SeagateHD/Kaiju"
     var drivePathToMonitor: String      // e.g., "/Volumes/SeagateHD" (empty if not external)
-    var syncIntervalMinutes: Int        // default: 15
+    static let maximumSyncIntervalMinutes = 525_600 // 365 days, safe for launchd seconds
+
+    var syncIntervalMinutes: Int        // default: 5
+    var syncOnLocalChanges: Bool        // default: true; false means schedule only
     var additionalRcloneFlags: String   // optional extra flags
     var isEnabled: Bool                 // whether scheduled sync is active
     var isMuted: Bool                   // whether notifications are muted for this profile
@@ -172,6 +175,15 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// Profile-specific log file
     var logPath: String {
         "\(NSHomeDirectory())/.local/log/synctray-sync-\(shortId).log"
+    }
+
+    /// Durable attempt time, independent of launchd loads and profile reinstalls.
+    var scheduleStatePath: String {
+        "\(NSHomeDirectory())/.local/state/synctray/schedules/\(shortId).json"
+    }
+
+    var scheduleIdentity: [String] {
+        [fullRemotePath, localSyncPath, syncMode.rawValue, syncDirection.rawValue]
     }
 
     /// Profile-specific exclude filter file
@@ -348,6 +360,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         localSyncPath: String = "",
         drivePathToMonitor: String = "",
         syncIntervalMinutes: Int = 5,
+        syncOnLocalChanges: Bool = true,
         additionalRcloneFlags: String = "",
         isEnabled: Bool = false,
         isMuted: Bool = false,
@@ -379,7 +392,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.remotePath = remotePath
         self.localSyncPath = localSyncPath
         self.drivePathToMonitor = drivePathToMonitor
-        self.syncIntervalMinutes = syncIntervalMinutes
+        self.syncIntervalMinutes = min(max(1, syncIntervalMinutes), Self.maximumSyncIntervalMinutes)
+        self.syncOnLocalChanges = syncOnLocalChanges
         self.additionalRcloneFlags = additionalRcloneFlags
         self.isEnabled = isEnabled
         self.isMuted = isMuted
@@ -485,7 +499,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
 extension SyncProfile {
     enum CodingKeys: String, CodingKey {
         case id, name, rcloneRemote, remotePath, localSyncPath
-        case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
+        case drivePathToMonitor, syncIntervalMinutes, syncOnLocalChanges, additionalRcloneFlags
         case isEnabled, isMuted, syncMode, syncDirection
         case fallbackRemote, fallbackRemotePath, fallbackRequiresCacheRebuild
         case mountBackend
@@ -510,7 +524,8 @@ extension SyncProfile {
         // keys. These three mirror the memberwise-init defaults exactly, so an
         // app-written file (which always emits them) round-trips unchanged.
         drivePathToMonitor = try container.decodeIfPresent(String.self, forKey: .drivePathToMonitor) ?? ""
-        syncIntervalMinutes = try container.decodeIfPresent(Int.self, forKey: .syncIntervalMinutes) ?? 5
+        syncIntervalMinutes = min(max(1, try container.decodeIfPresent(Int.self, forKey: .syncIntervalMinutes) ?? 5), Self.maximumSyncIntervalMinutes)
+        syncOnLocalChanges = try container.decodeIfPresent(Bool.self, forKey: .syncOnLocalChanges) ?? true
         additionalRcloneFlags = try container.decodeIfPresent(String.self, forKey: .additionalRcloneFlags) ?? ""
         isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? false
         // Backwards compatibility: default to false if not present
