@@ -117,6 +117,7 @@ enum ConfigSelfTest {
             testRCAPIAuthenticated,
             testShimQuotesExecutablePath,
             testMountModeFileNotInSharedTmp,
+            testLogAndProfileDirsOwnerOnly,
             testRemoteFolderListingKeepsSpaces,
             testCLIRemoteFolders,
             testCLITelemetryConsent,
@@ -3691,6 +3692,66 @@ enum ConfigSelfTest {
               !SyncSetupService.derivedConfigHasStaleMountModePath(config(nil), expected: path),
               !SyncSetupService.derivedConfigHasStaleMountModePath(nil, expected: path) else {
             return report(name, slug, false, "(stale-derived-config detection wrong)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SEC5 — the sync-log and profile directories are owner-only
+
+    /// The sync logs name every synced file and the profile JSON names remotes, local paths
+    /// and extra rclone flags. Earlier versions created both directories with the default
+    /// mode (0755), so on a Mac whose home folder other accounts can traverse, they could
+    /// read them (CWE-276). Asserts the launch-time tighten drops group/other bits from a
+    /// loose directory owned by this user, leaves an already-0700 directory, a symlink (and
+    /// its target), a regular file and a missing path alone, and that the profile writer
+    /// creates a new directory 0700. Also pins the once-per-launch call.
+    private static func testLogAndProfileDirsOwnerOnly() -> Bool {
+        let name = "AC-SEC5", slug = "log-and-profile-dirs-owner-only"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/sec5-\(UUID().uuidString)"
+        defer { try? fm.removeItem(atPath: root) }
+
+        func makeDir(_ path: String, mode: Int) -> Bool {
+            (try? fm.createDirectory(atPath: path, withIntermediateDirectories: true)) != nil
+                && (try? fm.setAttributes([.posixPermissions: mode], ofItemAtPath: path)) != nil
+        }
+        func mode(_ path: String) -> Int? {
+            ((try? fm.attributesOfItem(atPath: path))?[.posixPermissions] as? Int).map { $0 & 0o777 }
+        }
+
+        let loose = "\(root)/loose", tight = "\(root)/tight", target = "\(root)/target"
+        let link = "\(root)/link", file = "\(root)/file", missing = "\(root)/missing"
+        guard makeDir(loose, mode: 0o755), makeDir(tight, mode: 0o700), makeDir(target, mode: 0o755),
+              (try? fm.createSymbolicLink(atPath: link, withDestinationPath: target)) != nil,
+              fm.createFile(atPath: file, contents: nil, attributes: [.posixPermissions: 0o644]) else {
+            return report(name, slug, false, "(could not create fixtures under \(root))")
+        }
+
+        guard SyncSetupService.tightenDirectoryIfLoose(atPath: loose), mode(loose) == 0o700 else {
+            return report(name, slug, false, "(a 0755 directory was not tightened to 0700: \(String(describing: mode(loose))))")
+        }
+        guard !SyncSetupService.tightenDirectoryIfLoose(atPath: tight), mode(tight) == 0o700 else {
+            return report(name, slug, false, "(an already-0700 directory was changed)")
+        }
+        guard !SyncSetupService.tightenDirectoryIfLoose(atPath: link), mode(target) == 0o755 else {
+            return report(name, slug, false, "(a symlinked directory was followed and changed)")
+        }
+        guard !SyncSetupService.tightenDirectoryIfLoose(atPath: file), mode(file) == 0o644 else {
+            return report(name, slug, false, "(a regular file was changed)")
+        }
+        guard !SyncSetupService.tightenDirectoryIfLoose(atPath: missing), !fm.fileExists(atPath: missing) else {
+            return report(name, slug, false, "(a missing path was created or reported as tightened)")
+        }
+
+        let profilesDir = "\(root)/profiles"
+        guard ProfileStore.writeProfileFile(sampleProfile(), in: profilesDir) != nil,
+              mode(profilesDir) == 0o700 else {
+            return report(name, slug, false, "(the profile writer created its directory with mode \(String(describing: mode(profilesDir))), not 0700)")
+        }
+
+        guard let appSource = readSourceFile("SyncTrayApp.swift"),
+              appSource.contains("SyncSetupService.tightenPrivateDirectoriesIfLoose()") else {
+            return report(name, slug, false, "(SyncTrayApp no longer tightens the directories at launch)")
         }
         return report(name, slug, true)
     }

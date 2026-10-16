@@ -34,6 +34,8 @@ struct SyncTrayApp: App {
 
         // Earlier wizards wrote rclone.conf 0644; tighten it now instead of waiting for the next remote edit.
         RcloneConfigService.shared.tightenConfigPermissionsIfLoose()
+        // Same for the sync-log and profile directories, which earlier versions created 0755.
+        SyncSetupService.tightenPrivateDirectoriesIfLoose()
 
         // Initialize telemetry (no-op if disabled)
         TelemetryService.shared.configure()

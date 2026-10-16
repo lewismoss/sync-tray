@@ -120,6 +120,34 @@ final class SyncSetupService {
         return onDisk != expected
     }
 
+    /// Tighten the sync-log and profile directories that earlier versions created with the
+    /// default mode (0755). The logs name every synced file and the profile JSON names
+    /// remotes, local paths and extra rclone flags, so neither should be listable by other
+    /// local accounts. New installs create both 0700; this fixes existing ones. Called once
+    /// per launch, next to `RcloneConfigService.tightenConfigPermissionsIfLoose()`.
+    static func tightenPrivateDirectoriesIfLoose() {
+        tightenDirectoryIfLoose(atPath: SyncProfile.logDirectory)
+        tightenDirectoryIfLoose(atPath: SyncProfile.configDirectory)
+    }
+
+    /// Drop group/other bits from `path` when it is a real directory owned by this user.
+    /// Nothing is created and nothing below it is touched. `attributesOfItem` does not
+    /// follow a final symlink, so a symlinked directory is left alone. Returns true only
+    /// when the mode was changed. Covered by `ConfigSelfTest` AC-SEC5.
+    @discardableResult
+    static func tightenDirectoryIfLoose(atPath path: String) -> Bool {
+        let fileManager = FileManager.default
+        guard let attrs = try? fileManager.attributesOfItem(atPath: path),
+              attrs[.type] as? FileAttributeType == .typeDirectory,
+              (attrs[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
+              let mode = attrs[.posixPermissions] as? Int,
+              mode & 0o077 != 0 else { return false }
+
+        // Keep the owner bits as they are and drop only group/other.
+        return (try? fileManager.setAttributes(
+            [.posixPermissions: mode & 0o700], ofItemAtPath: path)) != nil
+    }
+
     /// Generate and install the sync script and launchd plist for a profile
     /// - Parameters:
     ///   - profile: The sync profile to install
@@ -2542,16 +2570,19 @@ extension SyncSetupService {
             try fm.createDirectory(atPath: binDir, withIntermediateDirectories: true)
         }
 
-        // Create ~/.local/log if needed
+        // Create ~/.local/log if needed — owner-only: the logs name every synced file
         let logDir = (profile.logPath as NSString).deletingLastPathComponent
         if !fm.fileExists(atPath: logDir) {
-            try fm.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+            try fm.createDirectory(
+                atPath: logDir, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
         }
 
-        // Create ~/.config/synctray/profiles if needed
+        // Create ~/.config/synctray/profiles if needed — owner-only, like the logs
         if !fm.fileExists(atPath: SyncProfile.configDirectory) {
             try fm.createDirectory(
-                atPath: SyncProfile.configDirectory, withIntermediateDirectories: true)
+                atPath: SyncProfile.configDirectory, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
         }
 
         // LaunchAgents directory should already exist, but just in case

@@ -42,7 +42,9 @@ final class LogWatcher {
         let fileManager = FileManager.default
         if !fileManager.fileExists(atPath: logPath) {
             let directory = (logPath as NSString).deletingLastPathComponent
-            try? fileManager.createDirectory(atPath: directory, withIntermediateDirectories: true)
+            try? fileManager.createDirectory(
+                atPath: directory, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
             fileManager.createFile(atPath: logPath, contents: nil)
         }
 
