@@ -108,6 +108,7 @@ enum ConfigSelfTest {
             testMountModeParse,
             testWarmMenuBarSummary,
             testWarmAutoPauseReaders,
+            testWarmPauseReaderTelemetry,
             testMountModeTransitionText,
             testMountNoFallbackOverride,
             testCacheSuffixConsolidation,
@@ -3023,6 +3024,48 @@ enum ConfigSelfTest {
             return report("AC-WV2", "warm-auto-pause", false, "(nil lsof must not pause)")
         }
         return report("AC-WV2", "warm-auto-pause", true)
+    }
+
+    // MARK: - AC-WV3 — an auto-pause reports which process took the link, bounded
+
+    /// The auto-pause hands its readers to telemetry (`SyncManager.warmPauseReaders`), and the
+    /// log attribute stays bounded and privacy-safe (`TelemetryService.warmPauseReaderSummary`):
+    /// allowlisted macOS components by name, shells as `shell`, every other app as `app`,
+    /// distinct, sorted, capped.
+    private static func testWarmPauseReaderTelemetry() -> Bool {
+        let id = "AC-WV3", slug = "warm-pause-reader-telemetry"
+        let lsof = "p1\ncFinder\np2\ncSyncTray\np3\ncQuickLookSatellite\np4\ncREAPER\np5\nczsh\np6\ncREAPER\n"
+        guard SyncManager.warmPauseReaders(lsofOutput: lsof) == ["QuickLookSatellite", "REAPER", "zsh"] else {
+            return report(id, slug, false, "(warmPauseReaders did not keep exactly the interactive readers)")
+        }
+        guard SyncManager.warmPauseReaders(lsofOutput: nil).isEmpty,
+              SyncManager.warmPauseReaders(lsofOutput: "p1\ncSyncTray\n").isEmpty else {
+            return report(id, slug, false, "(a failed lsof or the warmer alone produced readers)")
+        }
+        guard SyncManager.shouldAutoPauseWarm(lsofOutput: lsof),
+              !SyncManager.shouldAutoPauseWarm(lsofOutput: nil) else {
+            return report(id, slug, false, "(shouldAutoPauseWarm no longer agrees with warmPauseReaders)")
+        }
+        guard TelemetryService.warmPauseReaderLabel("QuickLookSatellite") == "QuickLookSatellite",
+              TelemetryService.warmPauseReaderLabel("SyncTrayFinderSync") == "SyncTrayFinderSync",
+              TelemetryService.warmPauseReaderLabel("com.apple.quicklook.ThumbnailsA")
+                  == "com.apple.quicklook.ThumbnailsAgent",
+              TelemetryService.warmPauseReaderLabel("-zsh") == "shell",
+              TelemetryService.warmPauseReaderLabel("REAPER") == "app",
+              TelemetryService.warmPauseReaderLabel("Johns Private Tool") == "app" else {
+            return report(id, slug, false, "(a reader was not mapped to its bounded label)")
+        }
+        let summaryInput = ["zsh", "REAPER", "QuickLookSatellite", "REAPER"]
+        guard TelemetryService.warmPauseReaderSummary(summaryInput) == "QuickLookSatellite,app,shell" else {
+            return report(id, slug, false,
+                          "(summary not distinct+sorted: \(TelemetryService.warmPauseReaderSummary(summaryInput)))")
+        }
+        let many = ["QuickLookSatellite", "iconservicesagent", "revisiond", "bird", "cloudd", "backupd", "zsh", "X"]
+        guard TelemetryService.warmPauseReaderSummary(many).split(separator: ",").count
+                == TelemetryService.warmPauseReaderSummaryLimit else {
+            return report(id, slug, false, "(summary was not capped at warmPauseReaderSummaryLimit)")
+        }
+        return report(id, slug, true)
     }
 
     // MARK: - AC-MT1 — Cache Only ↔ Streaming switch shows a direction-aware transition
