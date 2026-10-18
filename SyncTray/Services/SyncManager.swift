@@ -2945,7 +2945,11 @@ final class SyncManager: ObservableObject {
             profileProgress[profileId] = nil  // Clear progress on failure
             lastSeenErrorMessage[profileId] = nil
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
-            // Report telemetry for failed sync
+            // Report telemetry for failed sync. Categorize from the run's FIRST error
+            // (`profileErrors` keeps the first error of the run, or the first critical one),
+            // not from rclone's closing notice: that notice only says what rclone skipped
+            // because of it ("not deleting files as there were IO errors"), so categorizing
+            // it filed e.g. every macOS privacy denial under "other".
             let failedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
             syncStartTimes[profileId] = nil
             TelemetryService.shared.recordSyncFailed(
@@ -2955,7 +2959,7 @@ final class SyncManager: ObservableObject {
                 duration: failedDuration,
                 filesChanged: currentSyncChanges[profileId]?.count ?? 0,
                 exitCode: exitCode,
-                errorMessage: message ?? profileErrors[profileId]
+                errorMessage: profileErrors[profileId] ?? message
             )
             // Only use the syncFailed message if we don't already have a more specific error
             if profileErrors[profileId] == nil, let msg = message {
@@ -2963,8 +2967,16 @@ final class SyncManager: ObservableObject {
             }
             let errorDescription = profileErrors[profileId] ?? message ?? "Exit code \(exitCode)"
             if !isNotificationsMuted(for: profileId) {
+                // A macOS privacy denial gets a sentence the user can act on instead of
+                // rclone's raw error; the profile's error banner offers the fixes.
+                let blockedSummary = profile.flatMap {
+                    SyncLogPatterns.macOSBlockedAccessSummary(for: errorDescription, localSyncPath: $0.localSyncPath)
+                }
+                let notificationText = blockedSummary
+                    .map { "\($0) Open SyncTray to exclude it or allow access." }
+                    ?? "Sync failed: \(errorDescription)"
                 notificationService.notifySyncError(
-                    "Sync failed: \(errorDescription)",
+                    notificationText,
                     profileId: profileId,
                     profileName: profile?.name
                 )
