@@ -125,6 +125,8 @@ enum ConfigSelfTest {
             testRemoteFolderListingKeepsSpaces,
             testCLIRemoteFolders,
             testCLITelemetryConsent,
+            testDoctorLockLiveness,
+            testRemoteProbePathScopedAndSummarized,
             testCLITelemetryFlushWaitsForSend,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
@@ -157,6 +159,11 @@ enum ConfigSelfTest {
             testMigrationV5PhotosLibraryExclude,
             testMacOSBlockedAccessPatterns,
             testMacOSBlockedAccessWiringPinned,
+            testPhotoBoothLibraryDefaultExclude,
+            testMigrationV8PhotoBoothLibraryExclude,
+            testFilterSaveFollowUpMatrix,
+            testStagedDontSyncSourcePins,
+            testStopThenSyncWiringPinned,
             testVolumeSystemFolderDefaultExclude,
             testMigrationV6VolumeSystemFolders,
             testMigrationV7VolumeSystemFolderResync,
@@ -208,6 +215,24 @@ enum ConfigSelfTest {
             print("\(id) \(slug): FAIL \(detail)")
         }
         return passed
+    }
+
+    /// Runs `/usr/bin/chflags <flag> <path>` and waits for it to exit. Used to isolate a single
+    /// fixture FILE's writability (`uchg` blocks a rename-over-target write without needing the
+    /// containing directory to be read-only, which would also block sibling writes) — see
+    /// AC-PL6's filter-write-fails case.
+    private static func runChflags(_ flag: String, _ path: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/chflags")
+        proc.arguments = [flag, path]
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            // Best-effort — the caller's own assertions will fail loudly if this didn't work.
+        }
     }
 
     private static func sampleProfile(
@@ -1607,6 +1632,7 @@ enum ConfigSelfTest {
         unmountProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
+        processIsAlive: @escaping (Int32) -> Bool = { _ in false },
         probeMount: @escaping (SyncProfile) -> MountProbe = { _ in
             MountProbe(mounted: false, processRunning: false, pendingUploads: 0)
         },
@@ -1645,6 +1671,7 @@ enum ConfigSelfTest {
             migrateCache: migrateCache,
             readStdin: readStdin,
             readFile: readFile,
+            processIsAlive: processIsAlive,
             probeMount: probeMount,
             warmEstimate: warmEstimate,
             remoteSkipsCertCheck: remoteSkipsCertCheck,
@@ -3872,6 +3899,173 @@ enum ConfigSelfTest {
               let banner = readSourceFile("Views/Settings/TelemetryOptInBanner.swift"),
               banner.contains("SyncTraySettings.telemetryConsentSummary") else {
             return report(name, slug, false, "(prompt not before execute, process kind unset, or banner copy not shared)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-CLI15 — doctor judges a lock file by its holder's liveness
+
+    /// `doctor`'s lock check (plan D4) must report a live holder as `ok` "sync running (PID n)"
+    /// (or "mount running" for a Stream profile), a dead holder as `warn` "stale lock file (PID
+    /// n not running)" while still exiting 0, `.pending` as `ok` "sync starting", an unparseable
+    /// present lock as `warn` "stale lock file (no PID recorded)", and no lock file at all as
+    /// `ok` "no stale lock" — never the old existence-only "stale lock file present".
+    private static func testDoctorLockLiveness() -> Bool {
+        let name = "AC-CLI15", slug = "doctor-lock-liveness"
+        let alwaysAlive: (Int32) -> Bool = { _ in true }
+        let neverAlive: (Int32) -> Bool = { _ in false }
+
+        let live = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "4242", isMount: false, isAlive: alwaysAlive)
+        guard live.status == .ok, live.detail == "sync running (PID 4242)" else {
+            return report(name, slug, false, "(live PID did not report ok sync running: \(live))")
+        }
+        let liveMount = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "4242", isMount: true, isAlive: alwaysAlive)
+        guard liveMount.status == .ok, liveMount.detail == "mount running (PID 4242)" else {
+            return report(name, slug, false, "(live PID on a mount profile did not say mount running: \(liveMount))")
+        }
+        let dead = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "4242", isMount: false, isAlive: neverAlive)
+        guard dead.status == .warn, dead.detail == "stale lock file (PID 4242 not running)" else {
+            return report(name, slug, false, "(dead PID did not report warn stale: \(dead))")
+        }
+        let pending = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "pending", isMount: false, isAlive: neverAlive)
+        guard pending.status == .ok, pending.detail == "sync starting" else {
+            return report(name, slug, false, "(.pending did not report ok sync starting: \(pending))")
+        }
+        let unreadable = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "garbage", isMount: false, isAlive: neverAlive)
+        guard unreadable.status == .warn, unreadable.detail == "stale lock file (no PID recorded)" else {
+            return report(name, slug, false, "(unreadable holder did not report warn no PID: \(unreadable))")
+        }
+        let emptyContents = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: nil, isMount: false, isAlive: neverAlive)
+        guard emptyContents.status == .warn, emptyContents.detail == "stale lock file (no PID recorded)" else {
+            return report(name, slug, false, "(present-but-unreadable lock did not report warn no PID: \(emptyContents))")
+        }
+        let absent = SyncTrayCLI.lockCheck(label: "p", exists: false, contents: nil, isMount: false, isAlive: alwaysAlive)
+        guard absent.status == .ok, absent.detail == "no stale lock" else {
+            return report(name, slug, false, "(absent lock did not report ok no stale lock: \(absent))")
+        }
+        // lockCheck must delegate liveness to SyncRunLock.isLive, so doctor and the app's
+        // single-run guard can never disagree about whether a lock is live.
+        guard let lockSource = readSourceFile("CLI/SyncTrayCLI.swift"),
+              lockSource.contains("SyncRunLock.isLive(holder, isAlive: isAlive)") else {
+            return report(name, slug, false, "(lockCheck no longer judges liveness via SyncRunLock.isLive)")
+        }
+
+        // Full doctor run: a dead-holder lock is a .warn, never a .fail, and exits 0.
+        let profile = sampleProfile(isEnabled: false)
+        let doctorEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            readProfiles: { [profile] },
+            fileExists: { path in path == profile.configPath || path == profile.lockFilePath },
+            schemaFilesPresent: { true },
+            readFile: { path in path == profile.lockFilePath ? "99999999" : nil },
+            processIsAlive: { _ in false }
+        )
+        let doctorChecks = SyncTrayCLI.doctorChecks(env: doctorEnv)
+        guard doctorChecks.contains(where: { $0.status == .warn && $0.detail.contains("not running") }) else {
+            return report(name, slug, false, "(a dead-PID lock did not surface as a warn in the full doctor report)")
+        }
+        guard SyncTrayCLI.run(.doctor, env: doctorEnv) == 0 else {
+            return report(name, slug, false, "(a stale-but-dead lock should not fail the doctor run)")
+        }
+
+        guard let cliSource = readSourceFile("CLI/SyncTrayCLI.swift"),
+              !cliSource.contains("\"stale lock file present\"") else {
+            return report(name, slug, false, "(the old existence-only lock message is still present)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-CLI16 — doctor/test-remote probe with lsjson --stat, never lsd
+
+    /// `remoteProbe` runs `lsjson --stat <remote>:<path>` (never `lsd`), treats exits 0/3/4 as
+    /// reachable, reports the CLI's own watchdog-timeout sentinel as "timed out after 15s", and
+    /// `rcloneFailureSummary` prefers an ERROR/CRITICAL stderr line over a NOTICE line (rclone's
+    /// shared-client_id notice was previously echoed as "the error").
+    private static func testRemoteProbePathScopedAndSummarized() -> Bool {
+        let name = "AC-CLI16", slug = "remote-probe-path-scoped"
+        var profile = sampleProfile()
+        profile.rcloneRemote = "myremote:"
+        profile.remotePath = "Some Path"
+
+        var capturedArgs: [String] = []
+        let okEnv = fakeCLIEnvironment(runRclone: { args, _ in capturedArgs = args; return (0, "{}", "") })
+        let okProbe = SyncTrayCLI.remoteProbe(for: profile, env: okEnv)
+        guard okProbe.reachable, !okProbe.pathMissing, okProbe.detail == "remote reachable",
+              capturedArgs.contains("lsjson"), capturedArgs.contains("--stat"),
+              capturedArgs.contains("myremote:Some Path"), !capturedArgs.contains("lsd") else {
+            return report(name, slug, false, "(exit 0 did not probe with lsjson --stat: \(capturedArgs))")
+        }
+
+        for exit: Int32 in [3, 4] {
+            let env = fakeCLIEnvironment(runRclone: { _, _ in (exit, "", "") })
+            let probe = SyncTrayCLI.remoteProbe(for: profile, env: env)
+            guard probe.reachable else {
+                return report(name, slug, false, "(exit \(exit) was not treated as reachable)")
+            }
+            // A missing path stays visible: doctor renders `pathMissing` as a warning, not "ok".
+            guard probe.pathMissing, probe.detail == "remote reachable, but path not found: Some Path" else {
+                return report(name, slug, false, "(exit \(exit) did not flag the missing path: \(probe))")
+            }
+        }
+
+        let timeoutEnv = fakeCLIEnvironment(runRclone: { _, _ in (CLIEnvironment.rcloneTimedOutExitCode, "", "") })
+        let timeoutProbe = SyncTrayCLI.remoteProbe(for: profile, env: timeoutEnv)
+        guard !timeoutProbe.reachable, timeoutProbe.detail == "remote unreachable: timed out after 15s" else {
+            return report(name, slug, false, "(a watchdog timeout was not reported by name: \(timeoutProbe))")
+        }
+
+        let noticeAndError = """
+            2026/10/19 09:00:00 NOTICE: Google drive root '': Auto set your own client_id
+            2026/10/19 09:00:01 ERROR : : error listing: directory not found
+            """
+        let errorEnv = fakeCLIEnvironment(runRclone: { _, _ in (1, "", noticeAndError) })
+        let errorProbe = SyncTrayCLI.remoteProbe(for: profile, env: errorEnv)
+        guard !errorProbe.reachable, errorProbe.detail == "remote unreachable: ERROR : : error listing: directory not found" else {
+            return report(name, slug, false, "(the NOTICE line was echoed instead of the ERROR line: \(errorProbe))")
+        }
+
+        let noticeOnly = "2026/10/19 09:00:00 NOTICE: Google drive root '': Auto set your own client_id"
+        guard SyncTrayCLI.rcloneFailureSummary(stderr: noticeOnly) == nil else {
+            return report(name, slug, false, "(a NOTICE-only stderr should summarize to nil)")
+        }
+        let noticeOnlyEnv = fakeCLIEnvironment(runRclone: { _, _ in (1, "", noticeOnly) })
+        guard SyncTrayCLI.remoteProbe(for: profile, env: noticeOnlyEnv).detail == "remote unreachable: rclone exited 1" else {
+            return report(name, slug, false, "(a NOTICE-only failure did not fall back to 'rclone exited N')")
+        }
+
+        var certArgs: [String] = []
+        let certEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in certArgs = args; return (0, "", "") },
+            remoteSkipsCertCheck: { $0 == "myremote" }
+        )
+        _ = SyncTrayCLI.remoteProbe(for: profile, env: certEnv)
+        guard certArgs.contains("--no-check-certificate") else {
+            return report(name, slug, false, "(remoteSkipsCertCheck was not honoured: \(certArgs))")
+        }
+
+        var emptyRemote = profile
+        emptyRemote.rcloneRemote = ""
+        let noRemoteProbe = SyncTrayCLI.remoteProbe(for: emptyRemote, env: fakeCLIEnvironment())
+        guard !noRemoteProbe.reachable, noRemoteProbe.detail.contains("no remote configured") else {
+            return report(name, slug, false, "(an empty remote did not report 'no remote configured': \(noRemoteProbe))")
+        }
+
+        // doctor and test-remote both route through the one probe — same args, never `lsd`.
+        guard let cliSource = readSourceFile("CLI/SyncTrayCLI.swift"), !cliSource.contains("\"lsd\"") else {
+            return report(name, slug, false, "(SyncTrayCLI.swift still references the old lsd probe)")
+        }
+        // End to end: a missing path is a doctor warning, never ok and never a failure.
+        let missingPathProfile = sampleProfile(isEnabled: false)
+        let missingPathEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (3, "", "") },
+            readProfiles: { [missingPathProfile] },
+            fileExists: { $0 == missingPathProfile.configPath },
+            schemaFilesPresent: { true }
+        )
+        let missingPathChecks = SyncTrayCLI.doctorChecks(env: missingPathEnv)
+        guard missingPathChecks.contains(where: { $0.status == .warn && $0.detail.hasPrefix("remote reachable, but path not found") }),
+              !missingPathChecks.contains(where: { $0.status == .fail }) else {
+            return report(name, slug, false, "(doctor did not report a missing path as a warning: \(missingPathChecks))")
         }
         return report(name, slug, true)
     }
@@ -7827,8 +8021,10 @@ enum ConfigSelfTest {
 
     /// Source pins: `.syncFailed` reports the run's first error (not rclone's closing notice)
     /// to telemetry; the error banner checks for a macOS block before the generic actions; the
-    /// Exclude action goes through the "Don't Sync" list rather than writing the filter itself;
-    /// and migration v5 is registered.
+    /// Exclude action only STAGES the pattern into the form's "Don't Sync" state (it calls
+    /// neither `updateSyncExcludePatterns` — retired — nor `triggerManualSync`, and never
+    /// writes the filter file directly: that happens on Save, via `filterSaveFollowUp` — plan
+    /// D9/D10); and migration v8 is registered after v7.
     private static func testMacOSBlockedAccessWiringPinned() -> Bool {
         let name = "AC-PL4", slug = "macos-blocked-access-wiring"
         guard let managerSource = readSourceFile("Services/SyncManager.swift"),
@@ -7845,14 +8041,385 @@ enum ConfigSelfTest {
               blocked.upperBound <= generic.lowerBound else {
             return report(name, slug, false, "(the error banner no longer offers the macOS-block actions first)")
         }
-        guard let excludeFn = extractFunctionBody(startingAt: "private func excludeBlockedPath()", in: viewSource),
-              excludeFn.contains("syncManager.updateSyncExcludePatterns("),
-              excludeFn.contains("syncManager.clearError(for: profile.id)"),
+        guard let excludeFn = extractFunctionBody(startingAt: "private func stageBlockedPathExclusion()", in: viewSource),
+              !excludeFn.contains("syncManager.updateSyncExcludePatterns("),
+              !excludeFn.contains("triggerManualSync"),
               !excludeFn.contains("writeExcludeFilter") else {
             return report(name, slug, false, "(Exclude from Sync bypasses the Don't Sync list)")
         }
-        guard migrationSource.contains("MigrationV4Retired(),\n        MigrationV5PhotosLibraryExclude(),") else {
-            return report(name, slug, false, "(migration v5 is not registered after v4)")
+        guard migrationSource.contains("MigrationV7VolumeSystemFolderResyncFromListings(),\n        MigrationV8PhotoBoothLibraryExclude(),") else {
+            return report(name, slug, false, "(migration v8 is not registered after v7)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-PL5 — the Apple Photo Booth library is excluded by default
+
+    /// A new filter file carries `- Photo Booth Library/**`, and `addingDefault(.photoBoothLibrary:)`
+    /// inserts it below the managed "Don't Sync" block and above the user's own rules (including
+    /// a `+` include, which would otherwise win first-match), stays stable under a later
+    /// `merged`, and never touches a file that already mentions "photo booth library" (any case).
+    /// Mirrors AC-PL1's shape exactly, since both now share `SyncExcludeFilter.addingDefault`.
+    private static func testPhotoBoothLibraryDefaultExclude() -> Bool {
+        let name = "AC-PL5", slug = "photo-booth-library-default-exclude"
+        let def = SyncExcludeFilter.DefaultExclude.photoBoothLibrary
+        let rule = def.rule
+        guard rule == "- Photo Booth Library/**" else {
+            return report(name, slug, false, "(unexpected rule text: \(rule))")
+        }
+
+        // 1. Defaults written on first create include the rule.
+        let dir = "\(selfTestRoot)/pl5"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = "\(dir)/exclude.txt"
+        var profile = sampleProfile()
+        profile.syncMode = .sync
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: path)
+        } catch {
+            return report(name, slug, false, "(first write threw: \(error))")
+        }
+        guard let fresh = try? String(contentsOfFile: path, encoding: .utf8),
+              fresh.contains("\n\(rule)\n"), fresh.contains("- *.photoslibrary/**"), fresh.contains("- .DS_Store") else {
+            return report(name, slug, false, "(a new filter file is missing \(rule))")
+        }
+
+        // 2. Inserted below the managed block, above the user's own rules.
+        let patterns = ["*.bak"]
+        let existing = SyncExcludeFilter.merged(existing: "- my-own-rule\n+ keep/**\n", patterns: patterns)
+        guard let migrated = SyncExcludeFilter.addingDefault(def, to: existing),
+              migrated.hasPrefix(SyncExcludeFilter.beginMarker),
+              let endRange = migrated.range(of: SyncExcludeFilter.endMarker),
+              let ruleRange = migrated.range(of: rule),
+              let includeRange = migrated.range(of: "+ keep/**"),
+              endRange.upperBound <= ruleRange.lowerBound,
+              ruleRange.upperBound <= includeRange.lowerBound,
+              migrated.contains("- my-own-rule"),
+              migrated.contains("- *.bak") else {
+            return report(name, slug, false, "(rule not placed between the managed block and the user's rules)")
+        }
+        guard SyncExcludeFilter.merged(existing: migrated, patterns: patterns) == migrated else {
+            return report(name, slug, false, "(a later merge with the same patterns rewrote the migrated file)")
+        }
+
+        // 3. No managed block: the rule goes first, the user's content follows untouched.
+        guard let plain = SyncExcludeFilter.addingDefault(def, to: "- my-own-rule\n"),
+              plain == def.section + "\n\n- my-own-rule\n" else {
+            return report(name, slug, false, "(unexpected output for a file without a managed block)")
+        }
+        guard SyncExcludeFilter.addingDefault(def, to: "") == def.section + "\n" else {
+            return report(name, slug, false, "(unexpected output for an empty file)")
+        }
+
+        // 4. Already present (any case), or the user's own rule for it: left alone.
+        guard SyncExcludeFilter.addingDefault(def, to: fresh) == nil,
+              SyncExcludeFilter.addingDefault(def, to: "+ Photo Booth Library/**\n") == nil,
+              SyncExcludeFilter.addingDefault(def, to: "- photo booth library/**\n") == nil else {
+            return report(name, slug, false, "(a file that already mentions Photo Booth Library was changed)")
+        }
+
+        // 5. The name check must run before the isPackage skip — Photo Booth Library IS a
+        //    package, and the walk must still find it (not be skipped as package contents).
+        guard def.matchesEntry(URL(fileURLWithPath: "/tmp/x/Photo Booth Library")) else {
+            return report(name, slug, false, "(matchesEntry did not recognize the package by name)")
+        }
+        // Telemetry: a Photo Booth denial gets its own bounded kind, never the path.
+        let boothDenial = "ERROR : Pictures/Photo Booth Library: error reading source directory: "
+            + "open /Users/me/Pictures/Photo Booth Library: operation not permitted"
+        guard TelemetryService.blockedPathKind("/Users/me/Pictures/Photo Booth Library") == "photo_booth_library",
+              TelemetryService.blockedPathKind("/Users/me/Pictures/photo booth library/Pictures") == "photo_booth_library",
+              TelemetryService.blockedPathKind("/Users/me/Pictures/Photo Booth Library Backup") == "other",
+              TelemetryService.accessDenialAttributes(for: boothDenial, localSyncPath: "/Users/me/Pictures")["error.blocked_path.kind"]
+                == .string("photo_booth_library") else {
+            return report(name, slug, false, "(a Photo Booth denial isn't bucketed as photo_booth_library)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-PL6 — migration v8 adds the Photo Booth rule to existing profiles, once
+
+    /// Every Two-Way and One-Way profile's existing filter gains the rule; a Two-Way profile
+    /// whose folder holds a `Photo Booth Library` also gets the resync-pending marker; Stream
+    /// profiles, missing filters and filters that already mention "photo booth library" are
+    /// untouched; a second pass changes nothing. Also pins the filter-before-marker write order
+    /// (plan D3): a marker-write failure rolls the filter back, and a filter-write failure never
+    /// schedules a marker.
+    private static func testMigrationV8PhotoBoothLibraryExclude() -> Bool {
+        let name = "AC-PL6", slug = "migration-v8-photo-booth-library"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/pl6"
+        try? fm.removeItem(atPath: dir)
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        struct Fixture {
+            let id = UUID()
+            let syncMode: String?
+            let localPath: String
+            let filter: String?
+            var shortId: String { String(id.uuidString.prefix(8)).lowercased() }
+        }
+        let withLibrary = "/tmp/synctray-selftest-pl6-with-library"
+        let fixtures: [String: Fixture] = [
+            "bisyncWithLibrary": Fixture(syncMode: "bisync", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "oneWayWithLibrary": Fixture(syncMode: "sync", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "bisyncNoLibrary": Fixture(syncMode: "bisync", localPath: "/tmp/synctray-selftest-pl6-plain", filter: "- .DS_Store\n"),
+            "legacyNoMode": Fixture(syncMode: nil, localPath: withLibrary, filter: "- .DS_Store\n"),
+            "mount": Fixture(syncMode: "mount", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "userRule": Fixture(syncMode: "bisync", localPath: withLibrary, filter: "+ Photo Booth Library/**\n"),
+            "noFilter": Fixture(syncMode: "bisync", localPath: withLibrary, filter: nil),
+        ]
+        for fixture in fixtures.values {
+            var dict: [String: Any] = ["id": fixture.id.uuidString, "name": "PL6", "localSyncPath": fixture.localPath]
+            if let mode = fixture.syncMode { dict["syncMode"] = mode }
+            guard let data = try? JSONSerialization.data(withJSONObject: dict),
+                  (try? data.write(to: URL(fileURLWithPath: "\(dir)/\(fixture.shortId).profile.json"))) != nil else {
+                return report(name, slug, false, "(failed to seed a profile file)")
+            }
+            if let filter = fixture.filter {
+                try? filter.write(toFile: "\(dir)/\(fixture.shortId)-exclude.txt", atomically: true, encoding: .utf8)
+            }
+        }
+        func filter(_ key: String) -> String? {
+            try? String(contentsOfFile: "\(dir)/\(fixtures[key]!.shortId)-exclude.txt", encoding: .utf8)
+        }
+        func hasMarker(_ key: String) -> Bool {
+            fm.fileExists(atPath: "\(dir)/\(fixtures[key]!.shortId).resync-pending")
+        }
+
+        let outcome = MigrationV8PhotoBoothLibraryExclude.addPhotoBoothLibraryExclude(in: dir) { $0 == withLibrary }
+        let expectedUpdated = ["bisyncWithLibrary", "oneWayWithLibrary", "bisyncNoLibrary", "legacyNoMode"]
+            .map { fixtures[$0]!.shortId }.sorted()
+        guard outcome.updated.sorted() == expectedUpdated,
+              outcome.resyncScheduled.sorted() == ["bisyncWithLibrary", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
+              outcome.failed.isEmpty else {
+            return report(name, slug, false, "(unexpected outcome: \(outcome))")
+        }
+        for key in ["bisyncWithLibrary", "oneWayWithLibrary", "bisyncNoLibrary", "legacyNoMode"] {
+            guard let text = filter(key), text.contains(SyncExcludeFilter.DefaultExclude.photoBoothLibrary.rule), text.hasSuffix("- .DS_Store\n") else {
+                return report(name, slug, false, "(\(key) filter did not gain the rule above its own content)")
+            }
+        }
+        guard hasMarker("bisyncWithLibrary"), hasMarker("legacyNoMode"),
+              !hasMarker("oneWayWithLibrary"), !hasMarker("bisyncNoLibrary") else {
+            return report(name, slug, false, "(resync marker written for the wrong profiles)")
+        }
+        guard filter("mount") == "- .DS_Store\n", filter("userRule") == "+ Photo Booth Library/**\n",
+              !hasMarker("mount"), !hasMarker("userRule"),
+              filter("noFilter") == nil else {
+            return report(name, slug, false, "(a Stream profile, a user rule, or a missing filter was touched)")
+        }
+
+        // Idempotent: a second pass changes nothing, including the scheduled token.
+        let markerPath = "\(dir)/\(fixtures["bisyncWithLibrary"]!.shortId).resync-pending"
+        let token = try? String(contentsOfFile: markerPath, encoding: .utf8)
+        let filtersBefore = fixtures.keys.sorted().map { filter($0) }
+        let second = MigrationV8PhotoBoothLibraryExclude.addPhotoBoothLibraryExclude(in: dir) { $0 == withLibrary }
+        guard second == MigrationV8PhotoBoothLibraryExclude.Outcome(),
+              fixtures.keys.sorted().map({ filter($0) }) == filtersBefore,
+              (try? String(contentsOfFile: markerPath, encoding: .utf8)) == token else {
+            return report(name, slug, false, "(a second pass changed something)")
+        }
+
+        // The real bounded walk: found within the depth limit, not past it, not in hidden
+        // folders — and it is a PACKAGE, so the name check must win before the package skip.
+        let tree = "\(selfTestRoot)/pl6-tree"
+        try? fm.removeItem(atPath: tree)
+        try? fm.createDirectory(atPath: "\(tree)/shallow/a/b/Photo Booth Library", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/deep/a/b/c/d/Photo Booth Library", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/hidden/.cache/Photo Booth Library", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/none/a/b", withIntermediateDirectories: true)
+        guard MigrationV8PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/shallow"),
+              !MigrationV8PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/deep"),
+              !MigrationV8PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/hidden"),
+              !MigrationV8PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/none"),
+              !MigrationV8PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/missing") else {
+            return report(name, slug, false, "(containsPhotoBoothLibrary walk gave a wrong answer)")
+        }
+
+        // Write-order pin (plan D3), filter-write-fails side: a 0555 DIRECTORY was tried first
+        // and rejected (pre-push review) — it blocks the marker write too (both are new sibling
+        // files via the same atomic-write pattern), so "no marker" would pass even under a
+        // marker-first order; it only proved a filter failure stops at `failed`, not the order.
+        // Instead, only the FILTER FILE itself is made immutable (`chflags uchg`, macOS's
+        // user-immutable flag — blocks the rename-over-target `String.write(atomically: true)`
+        // needs, even though the directory stays writable). The marker path is a distinct new
+        // file in the same (writable) directory, so only the filter write is forced to fail —
+        // isolating "filter write fails" from "marker write fails" (the rollback case below).
+        // The filter write must fail BEFORE any marker is attempted, so `failed` is recorded and
+        // NO marker file exists at all; if the order were ever flipped to marker-first, the
+        // marker would be written (nothing blocks it here) and this assertion would catch it.
+        let filterFailDir = "\(selfTestRoot)/pl6-filter-fail"
+        try? fm.removeItem(atPath: filterFailDir)
+        try? fm.createDirectory(atPath: filterFailDir, withIntermediateDirectories: true)
+        let ffFixture = Fixture(syncMode: "bisync", localPath: withLibrary, filter: "- .DS_Store\n")
+        let ffDict: [String: Any] = ["id": ffFixture.id.uuidString, "name": "PL6F", "localSyncPath": ffFixture.localPath, "syncMode": "bisync"]
+        guard let ffData = try? JSONSerialization.data(withJSONObject: ffDict),
+              (try? ffData.write(to: URL(fileURLWithPath: "\(filterFailDir)/\(ffFixture.shortId).profile.json"))) != nil else {
+            return report(name, slug, false, "(failed to seed the filter-write-failure fixture)")
+        }
+        let ffFilterPath = "\(filterFailDir)/\(ffFixture.shortId)-exclude.txt"
+        try? "- .DS_Store\n".write(toFile: ffFilterPath, atomically: true, encoding: .utf8)
+        runChflags("uchg", ffFilterPath)
+        let ffOutcome = MigrationV8PhotoBoothLibraryExclude.addPhotoBoothLibraryExclude(in: filterFailDir) { $0 == withLibrary }
+        runChflags("nouchg", ffFilterPath)
+        guard ffOutcome.failed == [ffFixture.shortId], ffOutcome.updated.isEmpty, ffOutcome.resyncScheduled.isEmpty,
+              !fm.fileExists(atPath: "\(filterFailDir)/\(ffFixture.shortId).resync-pending") else {
+            return report(name, slug, false, "(a filter write failure did not record failed with no marker attempted: \(ffOutcome))")
+        }
+
+        let rollbackDir = "\(selfTestRoot)/pl6-rollback"
+        try? fm.removeItem(atPath: rollbackDir)
+        try? fm.createDirectory(atPath: rollbackDir, withIntermediateDirectories: true)
+        let rbFixture = Fixture(syncMode: "bisync", localPath: withLibrary, filter: "- .DS_Store\n")
+        let rbDict: [String: Any] = ["id": rbFixture.id.uuidString, "name": "PL6R", "localSyncPath": rbFixture.localPath, "syncMode": "bisync"]
+        guard let rbData = try? JSONSerialization.data(withJSONObject: rbDict),
+              (try? rbData.write(to: URL(fileURLWithPath: "\(rollbackDir)/\(rbFixture.shortId).profile.json"))) != nil else {
+            return report(name, slug, false, "(failed to seed the rollback fixture)")
+        }
+        let rbFilterPath = "\(rollbackDir)/\(rbFixture.shortId)-exclude.txt"
+        try? "- .DS_Store\n".write(toFile: rbFilterPath, atomically: true, encoding: .utf8)
+        // Make the marker path itself a non-writable directory, so the marker "write" (which
+        // targets a file at that path) throws — the filter write must have already succeeded by
+        // then, and must be rolled back to its pre-migration contents afterward.
+        let rbMarkerPath = "\(rollbackDir)/\(rbFixture.shortId).resync-pending"
+        try? fm.createDirectory(atPath: rbMarkerPath, withIntermediateDirectories: true)
+        let rbOutcome = MigrationV8PhotoBoothLibraryExclude.addPhotoBoothLibraryExclude(in: rollbackDir) { $0 == withLibrary }
+        guard rbOutcome.failed == [rbFixture.shortId], rbOutcome.updated.isEmpty, rbOutcome.resyncScheduled.isEmpty,
+              (try? String(contentsOfFile: rbFilterPath, encoding: .utf8)) == "- .DS_Store\n" else {
+            return report(name, slug, false, "(a marker-write failure did not roll the filter back to its original contents)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DS6 — filterSaveFollowUp returns the right follow-up for every combination
+
+    /// Pure decision matrix (plan D7): a reinstall always wins (`.none`, the agent's own
+    /// `RunAtLoad` starts the sync); otherwise a filter-only change starts Sync Now
+    /// immediately when nothing is running, or asks to confirm stopping the run first when
+    /// something is; no filter change (or nothing installed yet) does nothing further.
+    private static func testFilterSaveFollowUpMatrix() -> Bool {
+        let name = "AC-DS6", slug = "filter-save-follow-up-matrix"
+        let cases: [(filterChanged: Bool, needsReinstall: Bool, runLive: Bool, installed: Bool, expected: FilterSaveFollowUp)] = [
+            (true, false, false, true, .syncNow),
+            (true, false, true, true, .confirmStopThenSync),
+            (true, true, false, true, .none),
+            (true, true, true, true, .none),
+            (false, false, false, true, .none),
+            (false, false, true, true, .none),
+            (true, false, false, false, .none),
+            (true, false, true, false, .none),
+        ]
+        for c in cases {
+            let got = SyncManager.filterSaveFollowUp(
+                filterChanged: c.filterChanged, needsReinstall: c.needsReinstall,
+                runLive: c.runLive, installed: c.installed
+            )
+            guard got == c.expected else {
+                return report(name, slug, false,
+                    "(filterChanged=\(c.filterChanged) needsReinstall=\(c.needsReinstall) runLive=\(c.runLive) "
+                        + "installed=\(c.installed) -> \(got), expected \(c.expected))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DS7 — staging source pins: the banner and the list editor change only form state
+
+    /// Source-text pins for plan D6/D9's staging contract: `stageBlockedPathExclusion` and
+    /// `DontSyncSection`'s pattern editor must change only the form's `@State`/`@Binding`
+    /// `syncExcludePatterns` — never call the retired `updateSyncExcludePatterns`, never write
+    /// the filter file, never trigger a sync — and `hasChanges` must notice a staged pattern
+    /// edit so Save stays unavailable until something actually changed.
+    private static func testStagedDontSyncSourcePins() -> Bool {
+        let name = "AC-DS7", slug = "staged-dont-sync-source-pins"
+        guard let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift") else {
+            return report(name, slug, false, "(could not read ProfileDetailView.swift)")
+        }
+        guard !viewSource.contains("updateSyncExcludePatterns(") else {
+            return report(name, slug, false, "(a call to the retired updateSyncExcludePatterns still exists)")
+        }
+        guard let stageFn = extractFunctionBody(startingAt: "private func stageBlockedPathExclusion()", in: viewSource) else {
+            return report(name, slug, false, "(stageBlockedPathExclusion() not found)")
+        }
+        guard stageFn.contains("syncExcludePatterns.append("),
+              !stageFn.contains("triggerManualSync"),
+              !stageFn.contains("writeExcludeFilter"),
+              !stageFn.contains("clearError") else {
+            return report(name, slug, false, "(stageBlockedPathExclusion does more than stage a pattern)")
+        }
+        // DontSyncSection is a top-level type (its own closing brace sits at column 0), so it is
+        // bounded by hand here rather than via `extractFunctionBody`, which only bounds a
+        // direct member (one level of nesting) and would stop at the first NESTED member's own
+        // 4-space-indented closing brace — far short of the whole struct.
+        let lines = viewSource.components(separatedBy: "\n")
+        guard let sectionStart = lines.firstIndex(where: { $0 == "struct DontSyncSection: View {" }),
+              let sectionEndOffset = lines[sectionStart...].firstIndex(where: { $0 == "}" }) else {
+            return report(name, slug, false, "(DontSyncSection not found)")
+        }
+        let sectionBody = lines[sectionStart...sectionEndOffset].joined(separator: "\n")
+        guard sectionBody.contains("@Binding var patterns: [String]") else {
+            return report(name, slug, false, "(DontSyncSection no longer binds patterns to the form's staged state)")
+        }
+        guard !sectionBody.contains("syncManager.updateSyncExcludePatterns") else {
+            return report(name, slug, false, "(DontSyncSection still writes through SyncManager on every edit)")
+        }
+        guard let hasChangesBody = extractFunctionBody(startingAt: "private var hasChanges: Bool {", in: viewSource),
+              hasChangesBody.contains("syncExcludePatterns != profile.syncExcludePatterns") else {
+            return report(name, slug, false, "(hasChanges does not account for a staged Don't Sync edit)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DS8 — stop-then-sync Save wiring is pinned by source-text assertions
+
+    /// Pins plan D7's Save flow: `applyFilterSaveAndFollowUp` writes the filter and clears the
+    /// error BEFORE the follow-up switch (so "saved == applied on disk" even if an abort gives
+    /// up), `.confirmStopThenSync` goes through `stopRunThenSync` (never a raw `abortSync` call
+    /// from the view), `stopRunThenSync` itself reuses `abortSync`/`abortTasks` with no new
+    /// pause, agent-load/unload, or lock touch (CLAUDE.md Rule 9), and `resumeAfterStopRunThenSync`
+    /// actually honors its own doc comment's claim of re-reading the profile (deleted/disabled
+    /// mid-abort never restarts a sync — pr-reviewer PR #118 finding).
+    private static func testStopThenSyncWiringPinned() -> Bool {
+        let name = "AC-DS8", slug = "stop-then-sync-wiring-pinned"
+        guard let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let managerSource = readSourceFile("Services/SyncManager.swift") else {
+            return report(name, slug, false, "(could not read source files)")
+        }
+        guard let applyFn = extractFunctionBody(
+            startingAt: "private func applyFilterSaveAndFollowUp(current: SyncProfile, updated: SyncProfile, followUp: FilterSaveFollowUp) {",
+            in: viewSource
+        ) else {
+            return report(name, slug, false, "(applyFilterSaveAndFollowUp not found)")
+        }
+        guard let writeRange = applyFn.range(of: "syncManager.applySyncFilterReconcile("),
+              let followUpRange = applyFn.range(of: "switch followUp {"),
+              writeRange.upperBound <= followUpRange.lowerBound else {
+            return report(name, slug, false, "(the filter is not written before the follow-up switch)")
+        }
+        guard applyFn.contains("syncManager.stopRunThenSync(for: updated)"),
+              !applyFn.contains("syncManager.abortSync(") else {
+            return report(name, slug, false, "(confirmStopThenSync does not go through stopRunThenSync)")
+        }
+        guard let stopFn = extractFunctionBody(startingAt: "func stopRunThenSync(for profile: SyncProfile) {", in: managerSource) else {
+            return report(name, slug, false, "(stopRunThenSync not found)")
+        }
+        guard stopFn.contains("abortSync(for: profile)"), stopFn.contains("abortTasks[profile.id]"),
+              !stopFn.contains("pause("), !stopFn.contains("loadAgent"), !stopFn.contains("unloadAgent"),
+              !stopFn.contains("removeStaleLocks"), !stopFn.contains("removeItem") else {
+            return report(name, slug, false, "(stopRunThenSync does more than reuse abortSync/abortTasks)")
+        }
+        guard let resumeFn = extractFunctionBody(
+            startingAt: "private func resumeAfterStopRunThenSync(for profile: SyncProfile) {", in: managerSource
+        ) else {
+            return report(name, slug, false, "(resumeAfterStopRunThenSync not found)")
+        }
+        // The restart must come from a guard that requires BOTH a live lookup (not the stale
+        // `?? profile` fallback) and `isEnabled` — a profile deleted or disabled mid-abort must
+        // never reach `triggerManualSync`.
+        guard resumeFn.contains("guard let latest = profileStore.profile(for: profile.id)"),
+              resumeFn.contains("latest.isEnabled"),
+              !resumeFn.contains("?? profile") else {
+            return report(name, slug, false, "(resumeAfterStopRunThenSync does not guard on a live, enabled profile)")
         }
         return report(name, slug, true)
     }

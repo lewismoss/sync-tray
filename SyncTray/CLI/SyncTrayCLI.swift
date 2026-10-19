@@ -169,6 +169,10 @@ struct CLIEnvironment {
     var readStdin: () -> String?
     /// Read a file's contents as UTF-8 text. `nil` if missing/unreadable.
     var readFile: (String) -> String?
+    /// Whether a PID belongs to a live process — the same liveness check the app's single-run
+    /// guard uses (`SyncRunLock.processIsAlive`), injected so `doctor`'s lock-liveness judgment
+    /// (D4) is testable without real PIDs.
+    var processIsAlive: (Int32) -> Bool
     /// Sample a Stream profile's runtime facts (mount table, rclone process,
     /// pending overlay uploads) for `status`. Never called for sync profiles.
     var probeMount: (SyncProfile) -> MountProbe
@@ -816,20 +820,106 @@ enum SyncTrayCLI {
             )
         }
 
+        let lockExists = env.fileExists(profile.lockFilePath)
         checks.append(
-            env.fileExists(profile.lockFilePath)
-                ? DoctorCheck(name: label, status: .warn, detail: "stale lock file present")
-                : DoctorCheck(name: label, status: .ok, detail: "no stale lock")
+            lockCheck(
+                label: label,
+                exists: lockExists,
+                contents: lockExists ? env.readFile(profile.lockFilePath) : nil,
+                isMount: profile.syncMode == .mount,
+                isAlive: env.processIsAlive
+            )
         )
 
-        let (remoteExit, _, remoteErr) = env.runRclone(["lsd", profile.fullRemotePath], 5)
-        checks.append(
-            remoteExit == 0
-                ? DoctorCheck(name: label, status: .ok, detail: "remote reachable")
-                : DoctorCheck(name: label, status: .fail, detail: "remote unreachable: \(remoteErr)")
-        )
+        let probe = remoteProbe(for: profile, env: env)
+        let probeStatus: DoctorCheck.Status = !probe.reachable ? .fail : (probe.pathMissing ? .warn : .ok)
+        checks.append(DoctorCheck(name: label, status: probeStatus, detail: probe.detail))
 
         return checks
+    }
+
+    /// Judge a profile's `/tmp` run lock by its holder's liveness (plan D4) rather than mere
+    /// existence — a live holder is `ok` ("sync running (PID n)", or "mount running" for a
+    /// Stream profile), a dead holder is `warn` "stale lock file (PID n not running)", an
+    /// unparseable-but-present lock is `warn` "stale lock file (no PID recorded)", and the
+    /// absence of a lock file at all is `ok` "no stale lock". Reuses
+    /// `SyncRunLock.parseHolder`/`isLive` so `doctor` and the app's own single-run guard can
+    /// never disagree about whether a lock is live. Exposed (not `private`) for `ConfigSelfTest`.
+    static func lockCheck(label: String, exists: Bool, contents: String?, isMount: Bool, isAlive: (Int32) -> Bool) -> DoctorCheck {
+        guard exists else {
+            return DoctorCheck(name: label, status: .ok, detail: "no stale lock")
+        }
+        let holder = SyncRunLock.parseHolder(contents)
+        let live = SyncRunLock.isLive(holder, isAlive: isAlive)
+        switch holder {
+        case .pid(let pid):
+            return live
+                ? DoctorCheck(name: label, status: .ok, detail: "\(isMount ? "mount" : "sync") running (PID \(pid))")
+                : DoctorCheck(name: label, status: .warn, detail: "stale lock file (PID \(pid) not running)")
+        case .pending where live:
+            return DoctorCheck(name: label, status: .ok, detail: "sync starting")
+        case .pending, .none, .unreadable:
+            return DoctorCheck(name: label, status: .warn, detail: "stale lock file (no PID recorded)")
+        }
+    }
+
+    /// Hard watchdog for the `doctor`/`test-remote` reachability probe — matches the sync
+    /// script's own `remote_path_reachable 15`.
+    static let remoteProbeTimeout: TimeInterval = 15
+
+    /// The single reachability probe shared by `doctor` and `test-remote` (plan D5): `lsjson
+    /// --stat <remote>:<path>` — never `lsd`, which lists the whole directory and can hang for
+    /// minutes on a large remote folder. Exit 0/3/4 means reachable (the remote answered); 3/4
+    /// ("not found") also sets `pathMissing`, which `doctor` reports as a warning — a missing path
+    /// is normal before a Two-Way profile's first sync, but is also how a typo looks; a watchdog timeout is reported by name rather than as a bare non-zero exit;
+    /// the error text prefers an ERROR/CRITICAL stderr line over rclone's shared-client_id
+    /// NOTICE line.
+    static func remoteProbe(for profile: SyncProfile, env: CLIEnvironment) -> (reachable: Bool, pathMissing: Bool, detail: String) {
+        guard var arguments = SyncManager.reachabilityProbeArguments(remote: profile.rcloneRemote, path: profile.remotePath) else {
+            return (false, false, "remote unreachable: no remote configured")
+        }
+        if env.remoteSkipsCertCheck(profile.primaryRemoteName) {
+            arguments.append("--no-check-certificate")
+        }
+        let (exit, _, stderr) = env.runRclone(arguments, remoteProbeTimeout)
+        if SyncManager.reachabilityProbeSucceeded(exitCode: exit) {
+            return exit == 0
+                ? (true, false, "remote reachable")
+                : (true, true, "remote reachable, but path not found: \(profile.remotePath)")
+        }
+        if exit == CLIEnvironment.rcloneTimedOutExitCode {
+            return (false, false, "remote unreachable: timed out after \(Int(remoteProbeTimeout))s")
+        }
+        if let summary = rcloneFailureSummary(stderr: stderr) {
+            return (false, false, "remote unreachable: \(summary)")
+        }
+        return (false, false, "remote unreachable: rclone exited \(exit)")
+    }
+
+    /// Picks the single most useful line from rclone's plain-text stderr: the last ERROR/
+    /// CRITICAL line (an actual failure), else the last non-empty line that isn't a NOTICE/INFO/
+    /// DEBUG log (rclone's shared-client_id NOTICE is the classic false lead), else `nil` — the
+    /// caller falls back to "rclone exited N". Strips rclone's own `YYYY/MM/DD HH:MM:SS ` prefix.
+    static func rcloneFailureSummary(stderr: String) -> String? {
+        let lines = stderr
+            .components(separatedBy: "\n")
+            .map(stripRcloneTimestampPrefix)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard !lines.isEmpty else { return nil }
+        if let line = lines.last(where: { $0.contains("ERROR") || $0.contains("CRITICAL") }) {
+            return line
+        }
+        if let line = lines.last(where: { !$0.contains("NOTICE") && !$0.contains("INFO") && !$0.contains("DEBUG") }) {
+            return line
+        }
+        return nil
+    }
+
+    /// Strips rclone's leading `YYYY/MM/DD HH:MM:SS ` timestamp from a log line, if present.
+    private static func stripRcloneTimestampPrefix(_ line: String) -> String {
+        let pattern = #"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} "#
+        guard let range = line.range(of: pattern, options: .regularExpression) else { return line }
+        return String(line[range.upperBound...])
     }
 
     // MARK: - test-remote
@@ -843,12 +933,15 @@ enum SyncTrayCLI {
         // Prints the remote name to the user's own terminal — fine. It is NEVER
         // a telemetry attribute: the CLI records only the bounded command verb
         // (see `runMeasured`), never a remote name, path, or profile name.
-        let (exit, _, err) = env.runRclone(["lsd", profile.fullRemotePath], 10)
-        if exit == 0 {
-            env.stdout("reachable: \(profile.fullRemotePath)\n")
+        let probe = remoteProbe(for: profile, env: env)
+        if probe.reachable {
+            env.stdout("reachable: \(profile.fullRemotePath)\(probe.pathMissing ? " (path not found)" : "")\n")
             return 0
         } else {
-            env.stderr("unreachable: \(err.isEmpty ? "rclone exited \(exit)" : err)\n")
+            let detail = probe.detail.hasPrefix("remote unreachable: ")
+                ? String(probe.detail.dropFirst("remote unreachable: ".count))
+                : probe.detail
+            env.stderr("unreachable: \(detail)\n")
             return 1
         }
     }
@@ -1965,6 +2058,7 @@ extension CLIEnvironment {
                 return String(data: data, encoding: .utf8)
             },
             readFile: { try? String(contentsOfFile: $0, encoding: .utf8) },
+            processIsAlive: { SyncRunLock.processIsAlive($0) },
             probeMount: { profile in CLIEnvironment.probeMountProcess(profile) },
             warmEstimate: { dir, profile in VFSCacheService.shared.estimateWarmWork(dir, for: profile) },
             remoteSkipsCertCheck: { name in
@@ -2161,6 +2255,14 @@ extension CLIEnvironment {
         return finalResult
     }
 
+    /// Sentinel exit code `runRcloneProcess` reports when its own watchdog fired and killed the
+    /// process, rather than rclone exiting on its own — GNU `timeout`'s convention (rclone's own
+    /// exit codes are 0–10, so 124 can never collide with a real rclone outcome). Callers that
+    /// already treat any non-zero exit as failure (e.g. `OverlaySyncService`) are unaffected;
+    /// `SyncTrayCLI.remoteProbe` is the one caller that reports this case by name ("timed out
+    /// after Ns").
+    static let rcloneTimedOutExitCode: Int32 = 124
+
     /// Run rclone at its located path with a hard process-level watchdog —
     /// mirrors `RcloneLocator.resolveViaLoginShell`'s timeout pattern, since
     /// SMB/WebDAV remotes can hang past rclone's own `--timeout`. Internal (not
@@ -2186,7 +2288,13 @@ extension CLIEnvironment {
             return (-1, "", "\(error)")
         }
 
-        let watchdog = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
+        var watchdogFired = false
+        let watchdog = DispatchWorkItem {
+            if proc.isRunning {
+                watchdogFired = true
+                proc.terminate()
+            }
+        }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
 
         // An unreachable remote fills stderr — the very output test-remote/doctor
@@ -2197,7 +2305,7 @@ extension CLIEnvironment {
         watchdog.cancel()
 
         return (
-            proc.terminationStatus,
+            watchdogFired ? rcloneTimedOutExitCode : proc.terminationStatus,
             String(decoding: outData, as: UTF8.self),
             String(decoding: errData, as: UTF8.self)
         )

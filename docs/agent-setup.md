@@ -219,8 +219,9 @@ They're worth copying into your agent's instructions file (`AGENTS.md`, `CLAUDE.
 | Signal                                        | Next step                                                                 |
 | --------------------------------------------- | ------------------------------------------------------------------------- |
 | `doctor`: `remote unreachable`                | `synctray test-remote <name>` prints rclone's real error                   |
+| `doctor`: `remote reachable, but path not found` | Expected before a Two-Way profile's first sync; otherwise check `remotePath` with `synctray remote folders <remote>:` |
 | `doctor`: `launchd agent not loaded`          | `synctray install <name>`                                                 |
-| `doctor`: `stale lock file present`           | Usually left by a run that was killed; SyncTray clears stale locks at launch |
+| `doctor`: `stale lock file (PID n not running)` or `(no PID recorded)` | Usually left by a run that was killed; SyncTray clears stale locks at launch |
 | `status`: `last=failed`                       | `synctray logs <name>` and look at the last error                         |
 | `status`: `state=stale`                       | The mount's server stopped. `synctray unmount <name>`, then `synctray mount <name>` |
 | `status`: `cache_only_fallback=true`          | Cache Only couldn't start and the mount is streaming; see the sync log     |

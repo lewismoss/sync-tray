@@ -3176,7 +3176,8 @@ final class TelemetryService {
     ///   folder or inside it — the case the error banner offers to exclude. Only when the
     ///   message names an absolute path and the caller passed the local folder.
     /// - `error.blocked_path.kind`: `volume_system_folder` (`SyncExcludeFilter.volumeSystemFolderNames`),
-    ///   `photos_library`, or `other` — only when the message names an absolute path.
+    ///   `photos_library`, `photo_booth_library`, or `other` — only when the message names an
+    ///   absolute path.
     static func accessDenialAttributes(for message: String?, localSyncPath: String?) -> [String: AttributeValue] {
         guard let message else { return [:] }
         guard let blocked = SyncLogPatterns.blockedAccess(in: message) else {
@@ -3200,7 +3201,7 @@ final class TelemetryService {
     }
 
     /// The bounded `error.blocked_path.kind` of a refused path: whether any of its components
-    /// is a macOS volume system folder or an Apple Photos library.
+    /// is a macOS volume system folder, an Apple Photos library, or an Apple Photo Booth library.
     static func blockedPathKind(_ path: String) -> String {
         let components = (path as NSString).pathComponents
         if components.contains(where: { SyncExcludeFilter.volumeSystemFolderNames.contains($0) }) {
@@ -3208,6 +3209,9 @@ final class TelemetryService {
         }
         if components.contains(where: { $0.lowercased().hasSuffix(".photoslibrary") }) {
             return "photos_library"
+        }
+        if components.contains(where: { $0.caseInsensitiveCompare("Photo Booth Library") == .orderedSame }) {
+            return "photo_booth_library"
         }
         return "other"
     }

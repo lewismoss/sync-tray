@@ -1086,9 +1086,10 @@ final class SyncManager: ObservableObject {
         // "Don't Sync" patterns AND "Sync Only These Folders" selective folders, also
         // ORTHOGONAL to `action`: a changed `syncExcludePatterns`/`syncIncludeFolders` yields
         // `action == .none` (the script re-reads the filter file every run), so rewrite the
-        // file here, with the same gate and the same outcome recording as the in-app editors
-        // (`updateSyncExcludePatterns` / `updateSyncIncludeFolders`). A failed write goes to
-        // `syncFilterErrors`, not `profileErrors`: every sync run clears `profileErrors`,
+        // file here, with the same gate and the same outcome recording as the in-app Save
+        // path (`ProfileDetailView.applyFilterSaveAndFollowUp` / `updateSyncIncludeFolders`).
+        // A failed write goes to `syncFilterErrors`, not `profileErrors`: every sync run clears
+        // `profileErrors`,
         // which would make the patterns look applied again. A bisync profile whose compiled
         // include rules actually change picks up its own resync-pending marker inside the
         // write — never a reinstall.
@@ -1986,6 +1987,47 @@ final class SyncManager: ObservableObject {
         abortTasks[profile.id] = Task { [weak self] in
             await self?.runAbort(for: profile)
         }
+    }
+
+    /// Stop a profile's live run, then start a fresh sync once it has ended — the follow-up a
+    /// confirmed "Stop the Current Sync and Apply?" Save performs after writing the new "Don't
+    /// Sync" filter (plan D7). Joins an abort already in flight rather than starting a second
+    /// one. Reuses `abortSync` only (CLAUDE.md Rule 9): no new signalling to rclone, no agent
+    /// load or unload, no pause, no lock touch — `runSyncScript` already performs the deferred
+    /// agent load and clears `abortSuppressUntil` once the aborted run needed it.
+    func stopRunThenSync(for profile: SyncProfile) {
+        if !isAborting(for: profile.id) {
+            abortSync(for: profile)
+        }
+        let inFlight = abortTasks[profile.id]
+        Task { [weak self] in
+            await inFlight?.value
+            self?.resumeAfterStopRunThenSync(for: profile)
+        }
+    }
+
+    /// The follow-through once `stopRunThenSync`'s abort has finished: start Sync Now only if
+    /// the abort actually ended the run — it can give up after `SyncAbort`'s own timeout, in
+    /// which case nothing is restarted and the already-saved filter simply applies from the
+    /// next run. Re-reads the profile from the store since it may have changed (disabled,
+    /// deleted, edited again) while the abort was in flight.
+    private func resumeAfterStopRunThenSync(for profile: SyncProfile) {
+        // Short-circuits on the lookup, so a deleted profile never reaches `isEnabled`/
+        // `isRunLive` with a stale snapshot — matches this function's own doc comment.
+        guard let latest = profileStore.profile(for: profile.id), latest.isEnabled,
+              !isAborting(for: profile.id), !isRunLive(for: latest) else {
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: profile.id, profileName: profile.name,
+                operation: "apply_sync_filter", syncMode: profile.syncMode.rawValue, result: "not_restarted"
+            )
+            return
+        }
+        clearError(for: profile.id)
+        triggerManualSync(for: latest)
+        TelemetryService.shared.recordProfileLifecycleOperation(
+            profileId: profile.id, profileName: profile.name,
+            operation: "apply_sync_filter", syncMode: profile.syncMode.rawValue, result: "restarted"
+        )
     }
 
     /// Skip the rest of an in-flight abort's graceful wait: SIGTERM the run now (SIGKILL
