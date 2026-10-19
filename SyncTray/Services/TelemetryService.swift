@@ -2357,6 +2357,14 @@ final class TelemetryService {
     // MARK: - Private Helpers
 
     private func buildResource() -> Resource {
+        Resource(attributes: resourceAttributes(includeInstallIdentity: true))
+    }
+
+    /// The resource attributes every signal carries. `includeInstallIdentity` is always true
+    /// for telemetry; a diagnostic report sent with usage data off passes false, which omits
+    /// `service.instance.id` and `enduser.id` and never reads `SyncTraySettings.installationId`
+    /// (reading it creates and persists an ID).
+    private func resourceAttributes(includeInstallIdentity: Bool) -> [String: AttributeValue] {
         let version = appVersion()
         let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
 
@@ -2364,12 +2372,14 @@ final class TelemetryService {
             ResourceAttributes.serviceName.rawValue: .string(Self.serviceName),
             ResourceAttributes.serviceNamespace.rawValue: .string("synctray"),
             ResourceAttributes.serviceVersion.rawValue: .string(version),
-            "service.instance.id": .string(SyncTraySettings.installationId),
-            "enduser.id": .string(SyncTraySettings.anonymousUserId),
             "synctray.process.kind": .string(Self.processKind),
             ResourceAttributes.osType.rawValue: .string("darwin"),
             ResourceAttributes.osVersion.rawValue: .string(osVersion),
         ]
+        if includeInstallIdentity {
+            attrs["service.instance.id"] = .string(SyncTraySettings.installationId)
+            attrs["enduser.id"] = .string(SyncTraySettings.anonymousUserId)
+        }
 
         if let hostArch = hostArch() {
             attrs["host.arch"] = .string(hostArch)
@@ -2410,8 +2420,13 @@ final class TelemetryService {
                 attrs[key] = .string(value)
             }
         }
+        if !includeInstallIdentity {
+            // Not even through an OTEL_RESOURCE_ATTRIBUTES override.
+            attrs.removeValue(forKey: "service.instance.id")
+            attrs.removeValue(forKey: "enduser.id")
+        }
 
-        return Resource(attributes: attrs)
+        return attrs
     }
 
     /// Deployment-precise version string for Dash0 correlation.
@@ -3334,6 +3349,60 @@ final class TelemetryService {
         return result
     }
 
+}
+
+// MARK: - Diagnostic reports (shared OTLP configuration)
+
+/// Read-only views of the exporter configuration, so `DiagnosticReportUploader` posts a
+/// user-sent diagnostic report to the same endpoint, with the same headers and resource
+/// attributes, as usage telemetry — without changing how telemetry itself is set up.
+/// Unlike every `record…` method, these are NOT gated on `telemetryEnabled`: a diagnostic
+/// report is its own per-send consent (see CLAUDE.md "Diagnostic reports").
+extension TelemetryService {
+    /// OTLP/HTTP base endpoint (env > `~/.config/synctray/.env` > Info.plist > default).
+    static var diagnosticExportEndpoint: String { endpoint }
+
+    /// The exporter's auth headers (`OTEL_EXPORTER_OTLP_HEADERS` or `DASH0_AUTH_TOKEN`).
+    static var diagnosticExportHeaders: [(String, String)] { authHeaders }
+
+    /// Whether this build can upload at all — the same condition `setupOTel` uses.
+    static var isDiagnosticExportConfigured: Bool { !authHeaders.isEmpty }
+
+    /// The resource attributes every telemetry signal carries (`service.name`,
+    /// `service.version`, `host.arch`, `deployment.environment.name`, …), as strings — plus
+    /// `service.instance.id` and `enduser.id` only when `includeInstallIdentity` is true.
+    /// With it false, `SyncTraySettings.installationId` is never read.
+    static func diagnosticResourceAttributes(includeInstallIdentity: Bool) -> [String: String] {
+        var result: [String: String] = [:]
+        for (key, value) in shared.resourceAttributes(includeInstallIdentity: includeInstallIdentity) {
+            if case let .string(text) = value {
+                result[key] = text
+            }
+        }
+        return result
+    }
+
+    /// The deployment-precise `service.version`, for the report header.
+    static var diagnosticServiceVersion: String { shared.appVersion() }
+
+    /// Record that the user sent (or tried to send) a diagnostic report. Bounded — the
+    /// report code, where it was sent from (`app`/`cli`), the result and the line count;
+    /// never any report content. Gated on the usage-data opt-in like every other event.
+    func recordDiagnosticReport(reportId: String, sourceUI: String, succeeded: Bool, lineCount: Int) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        emitLog(
+            severity: succeeded ? .info : .warn,
+            body: succeeded ? "Diagnostic report sent" : "Diagnostic report failed",
+            attributes: [
+                "diagnostics.report_id": .string(reportId),
+                "diagnostics.source_ui": .string(sourceUI),
+                "diagnostics.result": .string(succeeded ? "sent" : "failed"),
+                "diagnostics.line_count": .int(lineCount),
+            ]
+        )
+    }
 }
 
 // MARK: - Bounded profile descriptors (never a path or a remote name)
