@@ -893,7 +893,7 @@ the warmer reads as before — safe degradation.
 | `SyncProfile.swift` | Profile model with sync paths, remote config, fallback remote config, computed file paths |
 | `SyncState.swift` | Sync state enum, progress struct, file change model, `ActiveTransport`, `MountMode` (the four Cache-only-aware mount states), `SyncLogPatterns` for log parsing |
 | `RcloneLogEntry.swift` | JSON models for parsing rclone `--use-json-log` output |
-| `Settings.swift` | Global app settings (debug logging toggle, auto-fix sync issues toggle) |
+| `Settings.swift` | Global app settings (debug logging toggle, auto-fix sync issues toggle), plus `MenuBarIconStyle` / `MenuBarIconAppearance` — the menu bar icon's look (see "Menu bar icon appearance" below) |
 | `CacheMigrationProgress.swift` | Published per-profile progress for a cache-directory move (`CacheMigrationProgress`, shared `TransferFormat` byte/rate/elapsed helpers) |
 
 ### Services/
@@ -908,7 +908,7 @@ the warmer reads as before — safe degradation.
 | `DirectoryWatcher.swift` | FSEvents-based directory monitoring with debouncing |
 | `ConfigFileWatcher.swift` | FSEvents watcher on `~/.config/synctray` for external profile/settings edits; self-write suppression via `ConfigSelfWriteRegistry` |
 | `ConfigReconciler.swift` | `SyncManager.reconcileAction` (shared launchd install/uninstall/reinstall delta logic), `SyncManager.applyExternalCreateIfNeeded`/`ExternalCreateOutcome` (create-from-file decision), `warmReconcileNeeded`/`applyWarmReconcileIfNeeded` (orthogonal app-side warm delta — pinned dirs / warm-exclude globs), and `SettingsReconciler` (isolated launch-at-login apply) |
-| `AppSettingsFileStore.swift` | Reads/writes `~/.config/synctray/settings.json` — an enumerated safe-key mirror of `SyncTraySettings` (no secrets, no telemetry IDs) |
+| `AppSettingsFileStore.swift` | Reads/writes `~/.config/synctray/settings.json` — an enumerated mirror of the app-wide settings: on/off `SafeKey`s and validated `StringKey`s (the menu bar icon); no secrets, no telemetry IDs |
 | `ConfigSchemaInstaller.swift` | Copies the committed JSON Schemas into `~/.config/synctray/schema/` at launch |
 | `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`SyncTray --self-test`) — round-trip (incl. `warmExcludePatterns`), migration + migration-integrity, reconcile-delta, warm-reconcile-trigger, warm-skips-cached, self-write, isolated-login, external-create, and CLI assertions |
 | `NotificationService.swift` | Batched macOS notifications with action support |
@@ -923,7 +923,7 @@ the warmer reads as before — safe degradation.
 
 | File | Purpose |
 |------|---------|
-| `SyncTrayCLI.swift` | Headless `synctray` CLI — `CLICommand`, `parse`/`execute`/`run` (pure over `CLIEnvironment`), `doctorChecks`, `resolveProfile`, `applyProfileAssignment` (bounded `profile set` key set); mutating commands (`profile create`/`show`/`set`/`enable`/`disable`/`delete`, `sync`, `mount`/`unmount`, `install`/`reinstall`) drive `ProfileStore.writeProfileFile` + `SyncSetupService`; `runMeasured` records one `synctray.cli.invoked` event + flushes; dispatched from `SyncTrayApp.init` before SwiftUI/`SyncManager` |
+| `SyncTrayCLI.swift` | Headless `synctray` CLI — `CLICommand`, `parse`/`execute`/`run` (pure over `CLIEnvironment`), `doctorChecks`, `resolveProfile`, `applyProfileAssignment` (bounded `profile set` key set); mutating commands (`profile create`/`show`/`set`/`enable`/`disable`/`delete`, `settings set`, `sync`, `mount`/`unmount`, `install`/`reinstall`) drive `ProfileStore.writeProfileFile` + `SyncSetupService`; `runMeasured` records one `synctray.cli.invoked` event + flushes; dispatched from `SyncTrayApp.init` before SwiftUI/`SyncManager` |
 | `CLIShimInstaller.swift` | Writes/refreshes the `~/.local/bin/synctray` shim on every launch; marker-guarded so it never clobbers a non-SyncTray file |
 
 ### File-Backed Configuration
@@ -936,7 +936,7 @@ running app applies the change live, without a restart.
 |------|----------|-------|
 | `profiles/{shortId}.profile.json` | Full `SyncProfile`, including `isEnabled`, `isMuted`, `mountAtStartup`, and the app-side warm fields `pinnedDirectories` / `warmExcludePatterns` | NEW authoritative file. Written by `ProfileStore.save()` (encodes the whole model, so any new `SyncProfile` field flows in automatically); read by `ProfileStore.load()` (file-authoritative). References `../schema/profile.schema.json` via `$schema`. |
 | `profiles/{shortId}.json` | Derived, script-only subset (frozen key set) | Unchanged, byte-for-byte — this is `SyncSetupService.generateProfileConfig`'s output, consumed only by the sync shell script. The app never reads it back, except to rewrite a stale `mountModePath` at launch (`SyncSetupService.refreshMountModePathIfChanged`). |
-| `settings.json` | Enumerated safe subset of `SyncTraySettings` (`debugLoggingEnabled`, `autoFixSyncIssues`, `telemetryEnabled`, `launchAtLogin`) | Written by `AppSettingsFileStore`. Never contains secrets or telemetry identifiers (`installationId`, `anonymousUserId`). |
+| `settings.json` | Every app-wide setting: the on/off `SafeKey`s (`debugLoggingEnabled`, `autoFixSyncIssues`, `telemetryEnabled`, `launchAtLogin`) and the validated `StringKey`s (`menuBarIconStyle`, `menuBarIconSyncingColor`, `menuBarIconIdleColor`) | Written by `AppSettingsFileStore`. Never contains secrets or telemetry identifiers (`installationId`, `anonymousUserId`). An invalid value is ignored (key left unchanged). Launch applies the file BEFORE rewriting it from the app's state, so an edit made while the app was closed isn't discarded — but only the keys changed outside the app since it last wrote the file (`AppSettingsFileStore.keysChangedSinceLastWrite` against the `settingsFileLastWrittenSnapshot` the app's whole-file write stores in `UserDefaults`; the CLI's merge write doesn't update it, so a CLI change counts as outside), so an in-app change made without a file write, like the telemetry banner's opt-in, is never reverted by the stale value. Never `launchAtLogin`, which a stale file must not use to undo a System Settings change. A running app's live apply (`applyExternalSettingsEdit`) uses the same filter (including `launchAtLogin`; with no snapshot every valid key counts), so an in-app change is never reverted by a stale file there either, then rewrites the file. The schema's properties must equal `AppSettingsFileStore.allKeyNames` (AC-ST1). |
 | `schema/profile.schema.json`, `schema/settings.schema.json` | Committed JSON Schemas | Copied out of the app bundle by `ConfigSchemaInstaller` at every launch. Kept in lockstep with `SyncProfile.CodingKeys` by the fail-closed `scripts/check-schema-in-sync.sh`, run locally and in CI. |
 
 **Live apply, not a struct swap.** A single `ConfigFileWatcher` (FSEvents,
@@ -1272,7 +1272,7 @@ is the separate, fail-closed schema-drift gate.
 |------|---------|
 | `MenuBarView.swift` | Menu bar dropdown with profile status, recent changes, quick actions |
 | `SettingsView.swift` | Settings window with profile list and detail editor |
-| `AppSettingsView.swift` | Global app settings — launch at login, telemetry toggle, debug logging; About shows the exact release version (`SyncTrayReleaseVersion`, falling back to `CFBundleShortVersionString`) with a **Beta** tag on `/beta` builds (`SyncTrayReleaseChannel`) or a **Development** tag on a local debug build (`#if DEBUG`, purple vs the beta's orange) — the latter is how you tell a `.dev`-id dev instance apart from the installed production app when both run at once. Version keys are build-time Info.plist keys, because a beta never bumps `CFBundleShortVersionString`; see DEVELOPMENT.md "Release Channel and Version" |
+| `AppSettingsView.swift` | Global app settings — launch at login, Menu Bar Icon style (with a live preview), telemetry toggle, debug logging; About shows the exact release version (`SyncTrayReleaseVersion`, falling back to `CFBundleShortVersionString`) with a **Beta** tag on `/beta` builds (`SyncTrayReleaseChannel`) or a **Development** tag on a local debug build (`#if DEBUG`, purple vs the beta's orange) — the latter is how you tell a `.dev`-id dev instance apart from the installed production app when both run at once. Version keys are build-time Info.plist keys, because a beta never bumps `CFBundleShortVersionString`; see DEVELOPMENT.md "Release Channel and Version" |
 | `ProfileListView.swift` | Sidebar list of profiles with add/delete controls |
 | `StatusHeaderView.swift` | Header showing current sync state and progress |
 | `SyncProgressDetailView.swift` | Detailed per-file transfer progress during sync |
@@ -1281,6 +1281,27 @@ is the separate, fail-closed schema-drift gate.
 | `TelemetryDetailsSheet.swift` | Full privacy disclosure sheet — reachable from wizard, banner, and settings; its "Diagnostic reports — only when you send one" section explains the manual-report carve-out |
 | `DiagnosticReportSheet.swift` | "Send Diagnostic Report" sheet — scope picker, disclosure, Preview / Save to Desktop / Send, then the report code with Copy. Opened from the "Last sync error" banner and footer of `ProfileDetailView` and from App Settings → Help & Feedback |
 | `SetupWizardView.swift` | New-profile creation wizard, including optional `.helpImprove` epilogue step |
+
+**Menu bar icon appearance (App Settings → Menu Bar Icon) — an accessibility setting.**
+The default ring (a `systemBlue` arc over a 40%-opacity gray track) has little contrast on a
+blue-tinted menu bar: macOS tints a translucent menu bar with the wallpaper. `MenuBarIconStyle`
+(`Settings.swift`) offers `color` (default — exactly the look before the setting existed),
+`monochrome` (the ring is a **template** image and the status symbols drop their colors, so
+macOS draws everything in the menu bar's own text color, like Apple's icons), and `custom`
+(user-picked syncing and idle colors; the track follows the syncing color). The pure
+`MenuBarIconAppearance.resolve(style:syncingHex:idleHex:)` turns the stored preference into
+what `MenuBarIcon` / `CircularProgressIcon` draw; an unset or malformed `#RRGGBB` falls back to
+the default colors. Stored in `UserDefaults.standard` under `menuBarIconStyle`,
+`menuBarIconSyncingColor` and `menuBarIconIdleColor`, read with `@AppStorage` in `SyncTrayApp`
+(so a change redraws the label through the App body, like a state change) and written by
+`AppSettingsView`. Mirrored to `settings.json` as `AppSettingsFileStore.StringKey`s (validated by
+`StringKey.normalize`: a known style, `#RRGGBB` uppercased, or `""` for the default color) and
+settable with `synctray settings set`; an external edit is applied by writing the same
+`UserDefaults` keys in-process, which is what notifies `@AppStorage` (so the CLI's own
+cross-process write isn't relied on to redraw). The icon also carries a
+VoiceOver label (`MenuBarIcon.voiceOverLabel`, e.g. "SyncTray, syncing 42 percent"). Covered
+by `ConfigSelfTest` AC-MB1 (resolution, hex parsing, stored values) and AC-MB2 (template flag,
+drawn pixels, VoiceOver labels, wiring).
 
 ## Agent-Editable Configuration & CLI
 
@@ -1336,6 +1357,7 @@ Covered by `ConfigSelfTest` AC-CLI4 and AC-SEC3.
 | `synctray test-remote <name\|shortId>` | Probe one profile's remote with the same path-scoped `rclone lsjson --stat <remote>:<path>` probe `doctor` uses (never `lsd`) under a hard timeout; prints `reachable: <remote>` (with ` (path not found)` appended, still exit 0, when the remote answered but the path doesn't exist) or the real rclone stderr (ERROR/CRITICAL preferred over a NOTICE line). |
 | `synctray listremotes` | `rclone listremotes`, passthrough. |
 | `synctray remote folders <remote>[:path] [--json]` | List a remote's folders exactly as the profile editor's folder chooser and the setup wizard show them — same `rclone lsf --dirs-only` arguments (`RcloneConfigService.folderListingArguments`, including the remote's `no_check_certificate`) and the same parser (`parseDirectoryListing`), so names with spaces come out verbatim. Needs no profile. `--json` prints a JSON array, which makes leading/trailing spaces visible. Covered by `ConfigSelfTest` AC-CLI12 (and AC-RF1 for the parser). |
+| `synctray settings [show] [--json]` / `settings get <key>` | Every app-wide setting (or, with `get`, one) (`AppSettingsFileStore.allKeyNames`) with the value the app actually uses (UserDefaults, `SMAppService` for launch at login) — `key=value` lines, or a sorted-key object with `--json`. |
 | `synctray telemetry [status\|on\|off] [--json]` | Show or change whether usage data is shared — the same setting as the app's telemetry toggle (see "Privacy and consent" below). `status --json` prints `{"asked":…,"enabled":…}`. `on`/`off` count as answering the first-run question. |
 
 **Configure** (mutating — headless-capable, no running app required):
@@ -1349,6 +1371,7 @@ Covered by `ConfigSelfTest` AC-CLI4 and AC-SEC3.
 | `synctray profile delete <name\|shortId>` | Uninstall the agent (detaching a mounted volume first) and remove the `.profile.json`. |
 | `synctray install <name\|shortId>` | Install an already-enabled profile's launchd agent (idempotent; runs `SyncSetupService.install`). Complements `profile enable`, which early-returns without installing when the profile is ALREADY enabled — so `install` re-creates an agent that went missing. Refuses a disabled or incomplete profile. Never flips `isEnabled`. |
 | `synctray reinstall <name\|shortId>` | Regenerate script+plist and reinstall the agent (uninstall → install), i.e. the settings-save reinstall path; for a mounted Stream profile this detaches then remounts. Works for any sync mode. Refuses a disabled profile. |
+| `synctray settings set <key> <value> [<key> <value> …]` | Change app-wide settings. Every pair is validated first (`SyncTrayCLI.parseAppSetting`; a bad key or value exits `65` and writes nothing), then applied where the app reads it — `SyncTraySettings`/`UserDefaults`, `SMAppService` for `launchAtLogin`, `setTelemetryEnabledProcess` for `telemetryEnabled` (consent version + opt-out event) — and to `settings.json` through `updateSettingsFile(values:)`, which keeps the other keys (`telemetryEnabled` is written by `setTelemetryEnabledProcess` itself, so a set that includes it writes the file twice), so a running app applies it live and a stopped one already has it. Covered by `ConfigSelfTest` AC-ST1. |
 
 **Operate:**
 
@@ -1881,7 +1904,7 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SettingsView.swift` | Main settings UI with profile editing |
 | `ProfileStore.swift` | File-backed profile persistence — authoritative `{shortId}.profile.json` per profile, write-only blob mirror (see "File-Backed Configuration") |
 | `ConfigFileWatcher.swift` | Live-apply watcher for `~/.config/synctray` (profiles + settings); routes an unknown-id `.profile.json` to create-via-file |
-| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`/`remote folders`/`telemetry`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `install`/`reinstall`), operate (`sync`/`mount`/`unmount`/`cache move`), support (`report`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
+| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`/`remote folders`/`telemetry`/`settings show`/`settings get`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `settings set`, `install`/`reinstall`), operate (`sync`/`mount`/`unmount`/`cache move`), support (`report`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
 | `DiagnosticReport.swift` | User-sent diagnostic report: build, redact, render, OTLP-encode and upload (see "Diagnostic reports") |
 | `CLIShimInstaller.swift` | Installs the `~/.local/bin/synctray` shim (`~/.local/bin` must be on `PATH`) |
 | `SyncLogPatterns` | Centralized log message pattern matching (includes `isOutOfSyncError`) |

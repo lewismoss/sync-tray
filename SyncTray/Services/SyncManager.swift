@@ -470,6 +470,14 @@ final class SyncManager: ObservableObject {
         removeAllLegacyOfflineLinks()  // Clean up any (Offline) symlink left by the retired feature
         setupFinderSyncIPC()
         updateAppGroupMountPaths()
+        // Apply settings.json keys edited outside the app while it was closed, before the
+        // rewrite below discards them — never a key the app changed itself (the telemetry
+        // banner), and never launchAtLogin, which System Settings may have changed since.
+        let changedOutsideApp = AppSettingsFileStore.keysChangedSinceLastWrite(
+            file: AppSettingsFileStore.readSettingsFileJSON() ?? [:],
+            snapshot: AppSettingsFileStore.lastWrittenSnapshot()
+        )
+        applySettingsFile(includeLoginItem: false, onlyKeys: changedOutsideApp)
         refreshSettingsFile()
         startConfigWatcher()
     }
@@ -1157,11 +1165,49 @@ final class SyncManager: ObservableObject {
         startWarm(for: profileId, dirs: dirs, trigger: trigger)
     }
 
-    /// Apply an external edit to `settings.json`. Safe keys apply directly;
-    /// `launchAtLogin` goes through `SettingsReconciler`'s ISOLATED path so an
-    /// `SMAppService` failure can never corrupt anything else.
+    /// Apply an external edit to `settings.json` — only the keys changed since the
+    /// app last wrote the file (`keysChangedSinceLastWrite`, the same filter launch
+    /// uses), so a stale neighbour key the CLI's merge write carries along never
+    /// reverts a value the app changed without rewriting the file (the telemetry
+    /// banner, a login item toggled in System Settings). With no snapshot (the
+    /// launch write failed) every valid key counts as changed, so a hand edit is
+    /// never ignored. Safe keys apply directly; `launchAtLogin` goes through
+    /// `SettingsReconciler`'s ISOLATED path so an `SMAppService` failure can never
+    /// corrupt anything else. The file and snapshot are then rewritten to match
+    /// (a self-noted write, so the watcher ignores it).
     func applyExternalSettingsEdit() {
-        let safeSettings = AppSettingsFileStore.readSafeSettings()
+        // An unreadable or half-written file applies nothing — and isn't
+        // overwritten, so a hand edit with a typo is never lost.
+        guard let file = AppSettingsFileStore.readSettingsFileJSON() else { return }
+        let changed = AppSettingsFileStore.keysChangedSinceLastWrite(
+            file: file,
+            snapshot: AppSettingsFileStore.lastWrittenSnapshot() ?? [:]
+        )
+        applySettingsFile(includeLoginItem: true, onlyKeys: changed)
+        refreshSettingsFile()
+        TelemetryService.shared.recordExternalConfigEdit(kind: "settings")
+    }
+
+    /// Apply every valid key in `settings.json` to the app's settings — or, with
+    /// `onlyKeys`, just those keys. Keys that are absent or invalid are left
+    /// unchanged.
+    private func applySettingsFile(includeLoginItem: Bool, onlyKeys: Set<String>? = nil) {
+        var safeSettings = AppSettingsFileStore.readSafeSettings()
+        if !includeLoginItem { safeSettings[.launchAtLogin] = nil }
+        var stringSettings = AppSettingsFileStore.readStringSettings()
+        if let onlyKeys {
+            safeSettings = safeSettings.filter { onlyKeys.contains($0.key.rawValue) }
+            stringSettings = stringSettings.filter { onlyKeys.contains($0.key.rawValue) }
+        }
+
+        // String keys are the `@AppStorage` keys `SyncTrayApp` and
+        // `AppSettingsView` read, so writing them redraws the menu bar icon.
+        // Set even when the value looks unchanged: the CLI writes UserDefaults
+        // from its own process, and this in-process write is what notifies
+        // `@AppStorage`.
+        for (key, value) in stringSettings {
+            UserDefaults.standard.set(value, forKey: key.rawValue)
+        }
 
         SettingsReconciler.apply(
             safeSettings: safeSettings,
@@ -1190,8 +1236,6 @@ final class SyncManager: ObservableObject {
                 self.objectWillChange.send()
             }
         )
-
-        TelemetryService.shared.recordExternalConfigEdit(kind: "settings")
     }
 
     /// Get state for a specific profile

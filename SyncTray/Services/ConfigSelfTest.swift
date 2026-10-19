@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import OpenTelemetryApi
 
@@ -125,6 +126,7 @@ enum ConfigSelfTest {
             testRemoteFolderListingKeepsSpaces,
             testCLIRemoteFolders,
             testCLITelemetryConsent,
+            testAppSettingsCLIAndFile,
             testDoctorLockLiveness,
             testRemoteProbePathScopedAndSummarized,
             testCLITelemetryFlushWaitsForSend,
@@ -197,6 +199,8 @@ enum ConfigSelfTest {
             testCLIReportParsing,
             testCLIReportExecute,
             testReportSheetCancelStopsSend,
+            testMenuBarIconAppearance,
+            testMenuBarIconRendering,
         ]
 
         for check in checks {
@@ -3797,6 +3801,203 @@ enum ConfigSelfTest {
         guard exporterSessions == 3, flush.contains("waitUntilIdle("), quit.contains("waitUntilIdle(") else {
             return report(name, slug, false, "(exporters on the watched session: \(exporterSessions)/3; flushForExit waits: \(flush.contains("waitUntilIdle(")); shutdown waits: \(quit.contains("waitUntilIdle(")))")
         }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-ST1 — every app-wide setting is file- and CLI-controllable
+
+    /// Every app-wide setting must be readable and writable through `settings.json`
+    /// and `synctray settings`: the schema lists exactly the store's keys; string
+    /// values are validated and normalized; an invalid file value is ignored, never
+    /// applied; `settings set` validates every pair before writing any; and launch
+    /// applies the file before rewriting it, so an edit made while the app was
+    /// closed isn't discarded.
+    private static func testAppSettingsCLIAndFile() -> Bool {
+        let name = "AC-ST1", slug = "app-settings-cli-and-file"
+
+        guard let schemaText = readSourceFile("Resources/Schemas/settings.schema.json"),
+              let schema = (try? JSONSerialization.jsonObject(with: Data(schemaText.utf8))) as? [String: Any],
+              let properties = schema["properties"] as? [String: Any],
+              Set(properties.keys).subtracting(["$schema"]) == Set(AppSettingsFileStore.allKeyNames) else {
+            return report(name, slug, false, "(settings.schema.json properties differ from AppSettingsFileStore keys)")
+        }
+
+        typealias Key = AppSettingsFileStore.StringKey
+        let cases: [(Key, String, String?)] = [
+            (.menuBarIconStyle, "Monochrome", "monochrome"),
+            (.menuBarIconStyle, " custom ", "custom"),
+            (.menuBarIconStyle, "neon", nil),
+            (.menuBarIconStyle, "", nil),
+            (.menuBarIconSyncingColor, "ff8800", "#FF8800"),
+            (.menuBarIconSyncingColor, "#00aaFF", "#00AAFF"),
+            (.menuBarIconIdleColor, "", ""),
+            (.menuBarIconIdleColor, "#12345", nil),
+            (.menuBarIconIdleColor, "blue", nil),
+        ]
+        for (key, raw, expected) in cases where key.normalize(raw) != expected {
+            return report(name, slug, false, "(\(key.rawValue) normalize(\(raw.debugDescription)) = \(key.normalize(raw).debugDescription), want \(expected.debugDescription))")
+        }
+
+        let suiteName = "synctray.selftest.appsettings"
+        guard let suite = UserDefaults(suiteName: suiteName) else {
+            return report(name, slug, false, "(couldn't create a UserDefaults suite)")
+        }
+        suite.removePersistentDomain(forName: suiteName)
+        suite.set("bogus", forKey: Key.menuBarIconStyle.rawValue)
+        suite.set("#abcdef", forKey: Key.menuBarIconIdleColor.rawValue)
+        let current = AppSettingsFileStore.currentStringSettings(defaults: suite)
+        suite.removePersistentDomain(forName: suiteName)
+        guard current == [.menuBarIconStyle: "color", .menuBarIconSyncingColor: "", .menuBarIconIdleColor: "#ABCDEF"] else {
+            return report(name, slug, false, "(currentStringSettings didn't fall back / normalize: \(current))")
+        }
+
+        let dir = "\(selfTestRoot)/app-settings"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = "\(dir)/settings.json"
+        let seed = #"{"debugLoggingEnabled":true,"launchAtLogin":true,"menuBarIconStyle":"neon","menuBarIconIdleColor":"00ff00","menuBarIconSyncingColor":7}"#
+        FileManager.default.createFile(atPath: path, contents: Data(seed.utf8))
+        guard AppSettingsFileStore.readStringSettings(at: path) == [.menuBarIconIdleColor: "#00FF00"] else {
+            return report(name, slug, false, "(readStringSettings applied an invalid value: \(AppSettingsFileStore.readStringSettings(at: path)))")
+        }
+        guard AppSettingsFileStore.updateSettingsFile(
+                values: ["menuBarIconStyle": "custom", "autoFixSyncIssues": false], isLoginItemEnabled: false, directory: dir),
+              let written = FileManager.default.contents(atPath: path),
+              let json = (try? JSONSerialization.jsonObject(with: written)) as? [String: Any],
+              json["menuBarIconStyle"] as? String == "custom", json["autoFixSyncIssues"] as? Bool == false,
+              json["launchAtLogin"] as? Bool == true, json["debugLoggingEnabled"] as? Bool == true,
+              json["menuBarIconIdleColor"] as? String == "00ff00" else {
+            return report(name, slug, false, "(updateSettingsFile(values:) didn't keep the other keys)")
+        }
+
+        guard case .success(.settings(.show(json: false))) = SyncTrayCLI.parse(["settings"]),
+              case .success(.settings(.show(json: true))) = SyncTrayCLI.parse(["settings", "--json"]),
+              case .success(.settings(.show(json: true))) = SyncTrayCLI.parse(["settings", "show", "--json"]),
+              case .success(.settings(.get(key: "menuBarIconStyle"))) = SyncTrayCLI.parse(["settings", "get", "menuBarIconStyle"]),
+              case .success(.settings(.set(let pairs))) = SyncTrayCLI.parse(["settings", "set", "menuBarIconIdleColor", "", "debugLoggingEnabled", "on"]),
+              pairs == [ProfileAssignment(key: "menuBarIconIdleColor", value: ""), ProfileAssignment(key: "debugLoggingEnabled", value: "on")],
+              case .failure = SyncTrayCLI.parse(["settings", "set", "menuBarIconStyle"]),
+              case .failure = SyncTrayCLI.parse(["settings", "get"]),
+              case .failure = SyncTrayCLI.parse(["settings", "frob"]),
+              SyncTrayCLI.telemetryVerb(for: ["settings"]) == "settings-show",
+              SyncTrayCLI.telemetryVerb(for: ["settings", "set", "x", "y"]) == "settings-set",
+              SyncTrayCLI.telemetryVerb(for: ["settings", "frob"]) == "(other)" else {
+            return report(name, slug, false, "(settings parse or telemetry verb wrong)")
+        }
+
+        var writes: [[String: AppSettingValue]] = []
+        var out = "", err = ""
+        var env = fakeCLIEnvironment(stdout: { out += $0 }, stderr: { err += $0 })
+        env.readAppSettings = {
+            ["debugLoggingEnabled": .bool(false), "menuBarIconStyle": .string("color"), "menuBarIconIdleColor": .string("")]
+        }
+        env.writeAppSettings = { writes.append($0); return nil }
+
+        let bad = SyncTrayCLI.execute(["settings", "set", "debugLoggingEnabled", "true", "menuBarIconStyle", "neon"], env: env)
+        guard bad == 65, writes.isEmpty, err.contains("color|monochrome|custom") else {
+            return report(name, slug, false, "(a bad value didn't refuse before writing: exit \(bad), writes \(writes), err \(err.debugDescription))")
+        }
+        err = ""
+        guard SyncTrayCLI.execute(["settings", "set", "nope", "1"], env: env) == 65, writes.isEmpty, err.contains("unknown setting") else {
+            return report(name, slug, false, "(an unknown key wasn't refused)")
+        }
+        out = ""
+        let ok = SyncTrayCLI.execute(["settings", "set", "menuBarIconSyncingColor", "ff8800", "debugLoggingEnabled", "yes"], env: env)
+        guard ok == 0, writes == [["menuBarIconSyncingColor": .string("#FF8800"), "debugLoggingEnabled": .bool(true)]],
+              out == "debugLoggingEnabled=true\nmenuBarIconSyncingColor=#FF8800\n" else {
+            return report(name, slug, false, "(settings set wrote \(writes) / printed \(out.debugDescription))")
+        }
+        out = ""
+        guard SyncTrayCLI.execute(["settings"], env: env) == 0,
+              out == "debugLoggingEnabled=false\nmenuBarIconStyle=color\nmenuBarIconIdleColor=\n" else {
+            return report(name, slug, false, "(settings show printed \(out.debugDescription))")
+        }
+        out = ""
+        guard SyncTrayCLI.execute(["settings", "--json"], env: env) == 0,
+              let shown = (try? JSONSerialization.jsonObject(with: Data(out.utf8))) as? [String: Any],
+              shown["debugLoggingEnabled"] as? Bool == false, shown["menuBarIconStyle"] as? String == "color" else {
+            return report(name, slug, false, "(settings --json printed \(out.debugDescription))")
+        }
+        out = ""
+        guard SyncTrayCLI.execute(["settings", "get", "menuBarIconStyle"], env: env) == 0, out == "color\n",
+              SyncTrayCLI.execute(["settings", "get", "nope"], env: env) == 65 else {
+            return report(name, slug, false, "(settings get wrong: \(out.debugDescription))")
+        }
+
+        // Launch applies only keys changed outside the app since its last write.
+        let snapshot: [String: Any] = [
+            "debugLoggingEnabled": false, "autoFixSyncIssues": true, "telemetryEnabled": false, "launchAtLogin": false,
+            "menuBarIconStyle": "color", "menuBarIconSyncingColor": "", "menuBarIconIdleColor": "",
+        ]
+        // (a) The banner turned usage data on without rewriting the file: the stale `false` must not apply.
+        let bannerCase = AppSettingsFileStore.keysChangedSinceLastWrite(file: snapshot, snapshot: snapshot)
+        // (b) The CLI's merge write changed one key and carried the rest as the file had them.
+        var cliFile = snapshot
+        cliFile["debugLoggingEnabled"] = true
+        let cliCase = AppSettingsFileStore.keysChangedSinceLastWrite(file: cliFile, snapshot: snapshot)
+        // (c) A hand edit while the app was closed; a re-cased color is not a change.
+        var handSnapshot = snapshot
+        handSnapshot["menuBarIconIdleColor"] = "#ABCDEF"
+        var handFile = handSnapshot
+        handFile["menuBarIconStyle"] = "Monochrome"
+        handFile["menuBarIconIdleColor"] = "#abcdef"
+        let handCase = AppSettingsFileStore.keysChangedSinceLastWrite(file: handFile, snapshot: handSnapshot)
+        // (e) An invalid value never applies; a key missing from the snapshot counts as changed.
+        var invalidFile = snapshot
+        invalidFile["menuBarIconStyle"] = "neon"
+        invalidFile["telemetryEnabled"] = "yes"
+        var partialSnapshot = snapshot
+        partialSnapshot["menuBarIconIdleColor"] = nil
+        var newKeyFile = snapshot
+        newKeyFile["menuBarIconIdleColor"] = "#00FF00"
+        guard bannerCase.isEmpty,
+              cliCase == ["debugLoggingEnabled"],
+              handCase == ["menuBarIconStyle"],
+              AppSettingsFileStore.keysChangedSinceLastWrite(file: cliFile, snapshot: nil).isEmpty,  // (d)
+              AppSettingsFileStore.keysChangedSinceLastWrite(file: invalidFile, snapshot: snapshot).isEmpty,
+              AppSettingsFileStore.keysChangedSinceLastWrite(file: newKeyFile, snapshot: partialSnapshot) == ["menuBarIconIdleColor"] else {
+            return report(name, slug, false, "(launch change set wrong: banner \(bannerCase), cli \(cliCase), hand \(handCase))")
+        }
+
+        // The app's whole-file write stores a snapshot equal to the values it wrote.
+        let snapshotSuite = "synctray.selftest.appsettings.snapshot"
+        guard let snapshotDefaults = UserDefaults(suiteName: snapshotSuite) else {
+            return report(name, slug, false, "(couldn't create a UserDefaults suite)")
+        }
+        snapshotDefaults.removePersistentDomain(forName: snapshotSuite)
+        let snapshotDir = "\(dir)/snapshot"
+        let writtenPath = AppSettingsFileStore.writeSettingsFile(isLoginItemEnabled: true, directory: snapshotDir, defaults: snapshotDefaults)
+        var writtenValues = writtenPath.flatMap { AppSettingsFileStore.readSettingsFileJSON(at: $0) } ?? [:]
+        writtenValues["$schema"] = nil
+        let stored = AppSettingsFileStore.lastWrittenSnapshot(defaults: snapshotDefaults)
+        snapshotDefaults.removePersistentDomain(forName: snapshotSuite)
+        guard writtenPath != nil, let stored, Set(stored.keys) == Set(AppSettingsFileStore.allKeyNames),
+              NSDictionary(dictionary: stored).isEqual(to: writtenValues),
+              AppSettingsFileStore.keysChangedSinceLastWrite(file: writtenValues, snapshot: stored).isEmpty else {
+            return report(name, slug, false, "(writeSettingsFile's snapshot \(String(describing: stored)) != written \(writtenValues))")
+        }
+
+        guard let managerSource = readSourceFile("Services/SyncManager.swift"),
+              let decideAt = managerSource.range(of: "AppSettingsFileStore.keysChangedSinceLastWrite("),
+              let applyAt = managerSource.range(
+                of: "applySettingsFile(includeLoginItem: false, onlyKeys: changedOutsideApp)",
+                range: decideAt.upperBound..<managerSource.endIndex),
+              let rewriteAt = managerSource.range(of: "refreshSettingsFile()", range: applyAt.upperBound..<managerSource.endIndex),
+              !managerSource[decideAt.upperBound..<rewriteAt.lowerBound].contains("func ") else {
+            return report(name, slug, false, "(launch doesn't apply the outside-the-app changes in settings.json before rewriting it)")
+        }
+        // The live watcher path uses the same filter, then rewrites the file and snapshot.
+        guard let liveBody = extractFunctionBody(startingAt: "func applyExternalSettingsEdit()", in: managerSource),
+              let liveGuardAt = liveBody.range(of: "guard let file = AppSettingsFileStore.readSettingsFileJSON() else { return }"),
+              let liveDecideAt = liveBody.range(
+                of: "let changed = AppSettingsFileStore.keysChangedSinceLastWrite(",
+                range: liveGuardAt.upperBound..<liveBody.endIndex),
+              let liveApplyAt = liveBody.range(
+                of: "applySettingsFile(includeLoginItem: true, onlyKeys: changed)",
+                range: liveDecideAt.upperBound..<liveBody.endIndex),
+              liveBody.range(of: "refreshSettingsFile()", range: liveApplyAt.upperBound..<liveBody.endIndex) != nil else {
+            return report(name, slug, false, "(applyExternalSettingsEdit doesn't skip an unreadable file, then apply only the outside-the-app changes and rewrite settings.json)")
+        }
+
         return report(name, slug, true)
     }
 
@@ -10547,6 +10748,206 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(writePrivately replaced a directory at the output path)")
         }
         return report(name, slug, true)
+    }
+
+    // MARK: - AC-MB1 — menu bar icon appearance resolves to the right colors
+
+    /// App Settings → Menu Bar Icon, an accessibility setting: the default blue ring has
+    /// little contrast on a blue-tinted menu bar. The default must stay exactly the look
+    /// it replaced, Monochrome must be a template image without status colors, and Custom
+    /// must use the picked colors, falling back to the defaults for an unset or malformed
+    /// one. The stored raw values are a contract (users' UserDefaults hold them).
+    private static func testMenuBarIconAppearance() -> Bool {
+        let name = "AC-MB1", slug = "menu-bar-icon-appearance"
+
+        // Default (and an unset preference): the look before the setting existed.
+        let standard = MenuBarIconAppearance.standard
+        guard MenuBarIconAppearance.defaultStyle == .color,
+              menuBarColorsMatch(standard.syncingColor, .systemBlue),
+              menuBarColorsMatch(standard.idleColor, .gray),
+              menuBarColorsMatch(standard.trackColor, NSColor.gray.withAlphaComponent(0.4)),
+              !standard.isTemplate,
+              standard.usesStatusColors else {
+            return report(name, slug, false, "(the default style changed the original look)")
+        }
+
+        // A stored custom color only applies to the Custom style.
+        let colorStyle = MenuBarIconAppearance.resolve(style: .color, syncingHex: "#FFFFFF", idleHex: "#FFFFFF")
+        guard menuBarColorsMatch(colorStyle.syncingColor, .systemBlue),
+              menuBarColorsMatch(colorStyle.idleColor, .gray) else {
+            return report(name, slug, false, "(Color style used a stored custom color)")
+        }
+
+        // Monochrome: a template image, no status colors, the track fainter than the ring.
+        let mono = MenuBarIconAppearance.resolve(style: .monochrome, syncingHex: "#FF0000", idleHex: "#00FF00")
+        guard mono.isTemplate,
+              !mono.usesStatusColors,
+              mono.syncingColor.alphaComponent == 1,
+              mono.idleColor.alphaComponent == 1,
+              mono.trackColor.alphaComponent < mono.syncingColor.alphaComponent else {
+            return report(name, slug, false, "(Monochrome isn't an opaque template ring with a fainter track)")
+        }
+
+        // Custom: the picked colors, and a track derived from the syncing color.
+        let custom = MenuBarIconAppearance.resolve(style: .custom, syncingHex: "#ffd60a", idleHex: "#FFFFFF")
+        guard !custom.isTemplate,
+              custom.usesStatusColors,
+              menuBarRGBA(custom.syncingColor) == [255, 214, 10, 255],
+              menuBarRGBA(custom.idleColor) == [255, 255, 255, 255],
+              menuBarRGBA(custom.trackColor) == [255, 214, 10, 102] else {
+            return report(name, slug, false, "(Custom didn't use the picked colors: \(String(describing: menuBarRGBA(custom.syncingColor))))")
+        }
+
+        // Custom with an unset or malformed color falls back to the defaults.
+        let fallback = MenuBarIconAppearance.resolve(style: .custom, syncingHex: "", idleHex: "not-a-color")
+        guard menuBarColorsMatch(fallback.syncingColor, .systemBlue),
+              menuBarColorsMatch(fallback.idleColor, .gray) else {
+            return report(name, slug, false, "(Custom didn't fall back to the default colors)")
+        }
+
+        // Hex parsing: what's accepted and what isn't.
+        for accepted in ["#0A84FF", "0a84ff", "  #0A84FF\n"] {
+            guard menuBarRGBA(MenuBarIconAppearance.color(fromHex: accepted)) == [10, 132, 255, 255] else {
+                return report(name, slug, false, "(rejected \(accepted.debugDescription))")
+            }
+        }
+        for rejected in ["", "#", "#FFF", "#GGGGGG", "#0A84FF00", "+0A84F", "#-A84FF", "##0A84F"] {
+            guard MenuBarIconAppearance.color(fromHex: rejected) == nil else {
+                return report(name, slug, false, "(accepted \(rejected.debugDescription))")
+            }
+        }
+
+        // Formatting: sRGB, uppercase, opacity dropped, and a stable round trip.
+        guard MenuBarIconAppearance.hexString(from: NSColor(srgbRed: 1, green: 0.5, blue: 0, alpha: 0.3)) == "#FF8000" else {
+            return report(name, slug, false, "(hexString didn't format #FF8000)")
+        }
+        for hex in ["#000000", "#FFFFFF", "#0A84FF", "#FFD60A"] {
+            guard let parsed = MenuBarIconAppearance.color(fromHex: hex),
+                  MenuBarIconAppearance.hexString(from: parsed) == hex else {
+                return report(name, slug, false, "(\(hex) didn't round-trip)")
+            }
+        }
+
+        // Stored values.
+        guard MenuBarIconStyle.allCases.map(\.rawValue) == ["color", "monochrome", "custom"],
+              MenuBarIconStyle(rawValue: "neon") == nil,
+              MenuBarIconAppearance.styleKey == "menuBarIconStyle",
+              MenuBarIconAppearance.syncingColorKey == "menuBarIconSyncingColor",
+              MenuBarIconAppearance.idleColorKey == "menuBarIconIdleColor" else {
+            return report(name, slug, false, "(stored style values or keys changed)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-MB2 — the menu bar icon is drawn the way the appearance says
+
+    /// The drawn ring: the template flag (which decides whether the menu bar keeps the
+    /// drawn colors or draws the ring in its own text color), the color actually drawn
+    /// (so a hard-coded color can't return), the VoiceOver label, and the wiring from
+    /// the stored preference to the menu bar label and the settings screen.
+    private static func testMenuBarIconRendering() -> Bool {
+        let name = "AC-MB2", slug = "menu-bar-icon-rendering"
+
+        for style in MenuBarIconStyle.allCases {
+            let appearance = MenuBarIconAppearance.resolve(style: style, syncingHex: "#FFD60A", idleHex: "")
+            let image = CircularProgressIcon.makeImage(
+                percentage: 40, color: appearance.syncingColor,
+                trackColor: appearance.trackColor, isTemplate: appearance.isTemplate
+            )
+            guard image.isTemplate == (style == .monochrome) else {
+                return report(name, slug, false, "(\(style.rawValue): image isTemplate=\(image.isTemplate))")
+            }
+        }
+
+        // Pixels: (7, 1) sits on the arc just past its start at the top; (1, 7) on the
+        // left, which a 40% arc doesn't reach, so only the track is drawn there.
+        let custom = MenuBarIconAppearance.resolve(style: .custom, syncingHex: "#FFD60A", idleHex: "")
+        guard let customPixels = menuBarIconPixels(custom, percentage: 40),
+              let arc = customPixels.arc, let track = customPixels.track,
+              arc.redComponent > 0.75, arc.blueComponent < 0.35, arc.alphaComponent > 0.8,
+              track.alphaComponent > 0.15, track.alphaComponent < 0.65 else {
+            return report(name, slug, false, "(Custom ring wasn't drawn in the picked color)")
+        }
+        guard let standardPixels = menuBarIconPixels(.standard, percentage: 40),
+              let standardArc = standardPixels.arc,
+              standardArc.blueComponent > 0.7, standardArc.redComponent < 0.3 else {
+            return report(name, slug, false, "(default ring isn't blue)")
+        }
+
+        // VoiceOver.
+        let labels: [(SyncState, Double?, String)] = [
+            (.syncing, 41.6, "SyncTray, syncing 42 percent"),
+            (.syncing, 140, "SyncTray, syncing 100 percent"),
+            (.syncing, nil, "SyncTray, syncing"),
+            (.syncing, Double.nan, "SyncTray, syncing"),
+            (.idle, nil, "SyncTray, up to date"),
+            (.paused, nil, "SyncTray, paused"),
+            (.error("rclone exited 1"), nil, "SyncTray, sync error"),
+            (.driveNotMounted, nil, "SyncTray, drive not connected"),
+            (.notConfigured, nil, "SyncTray, setup required"),
+        ]
+        for (state, progress, expected) in labels {
+            let label = MenuBarIcon.voiceOverLabel(for: state, progress: progress)
+            guard label == expected else {
+                return report(name, slug, false, "(VoiceOver label \(label.debugDescription), expected \(expected.debugDescription))")
+            }
+        }
+
+        // Wiring: the menu bar label and the settings screen read the same keys, and the
+        // label no longer hard-codes the ring's colors.
+        guard let app = readSourceFile("SyncTrayApp.swift"),
+              let settings = readSourceFile("Views/AppSettingsView.swift") else {
+            return report(name, slug, false, "(couldn't read SyncTrayApp.swift / AppSettingsView.swift)")
+        }
+        let keys = ["@AppStorage(MenuBarIconAppearance.styleKey)",
+                    "@AppStorage(MenuBarIconAppearance.syncingColorKey)",
+                    "@AppStorage(MenuBarIconAppearance.idleColorKey)"]
+        guard keys.allSatisfy({ app.contains($0) && settings.contains($0) }),
+              app.contains("appearance: MenuBarIconAppearance.resolve("),
+              !app.contains("color: .systemBlue)"),
+              !app.contains("color: .gray)"),
+              app.contains("image.isTemplate = isTemplate") else {
+            return report(name, slug, false, "(menu bar icon isn't wired to the stored appearance)")
+        }
+        return report(name, slug, true)
+    }
+
+    /// sRGB components as 0–255 integers, or nil.
+    private static func menuBarRGBA(_ color: NSColor?) -> [Int]? {
+        guard let srgb = color?.usingColorSpace(.sRGB) else { return nil }
+        return [srgb.redComponent, srgb.greenComponent, srgb.blueComponent, srgb.alphaComponent]
+            .map { Int(($0 * 255).rounded()) }
+    }
+
+    /// Equal colors, or the same within one step per channel in sRGB.
+    private static func menuBarColorsMatch(_ a: NSColor, _ b: NSColor) -> Bool {
+        if a == b { return true }
+        guard let x = menuBarRGBA(a), let y = menuBarRGBA(b) else { return false }
+        return zip(x, y).allSatisfy { abs($0 - $1) <= 1 }
+    }
+
+    /// Draws the 14-pt ring into a 14×14 bitmap and returns two pixels: one on the arc
+    /// near its start at the top, and one on the left of the track.
+    private static func menuBarIconPixels(
+        _ appearance: MenuBarIconAppearance, percentage: Double
+    ) -> (arc: NSColor?, track: NSColor?)? {
+        let image = CircularProgressIcon.makeImage(
+            percentage: percentage, color: appearance.syncingColor,
+            trackColor: appearance.trackColor, isTemplate: appearance.isTemplate
+        )
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: 14, pixelsHigh: 14,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .calibratedRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ), let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        image.draw(in: NSRect(x: 0, y: 0, width: 14, height: 14))
+        context.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        // colorAt's y counts from the top row.
+        return (rep.colorAt(x: 7, y: 1)?.usingColorSpace(.sRGB),
+                rep.colorAt(x: 1, y: 7)?.usingColorSpace(.sRGB))
     }
 }
 
