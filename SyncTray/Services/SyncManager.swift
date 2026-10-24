@@ -507,6 +507,14 @@ final class SyncManager: ObservableObject {
     /// Profiles with a delayed auto-fix retry pending (`scheduleAutoFixLockRetryIfRefused`).
     private var autoFixLockRetryScheduled: Set<UUID> = []
 
+    /// Failed runs in a row per profile since its last success (in-memory). Lets a muted
+    /// profile that keeps failing still tell the user once (`notifiesSyncFailure`).
+    private var consecutiveFailedRuns: [UUID: Int] = [:]
+
+    /// Whether telemetry was on the last time `UserDefaults` changed, so turning it on while
+    /// the app runs can be told apart (`setupTelemetryOptInObserver`).
+    private var telemetryWasEnabled = SyncTraySettings.telemetryEnabled
+
     /// Single-run guard (CLAUDE.md "One Run Per Profile"): enforces one exclusive
     /// run per profile across every launch path (reinstall resync, Resync, Smart
     /// Fix, Unlock & Resync, Force Sync, auto-fix). Replaces the old
@@ -546,9 +554,11 @@ final class SyncManager: ObservableObject {
         checkInitialState()
         startWatchingAllProfiles()
         updateMountStates()  // Initialize mount states for mount mode profiles
-        // Report active profile count and configuration snapshot for telemetry
-        TelemetryService.shared.recordProfileCount(self.profileStore.enabledProfiles.count)
-        TelemetryService.shared.recordAllProfileConfigurations(self.profileStore.profiles)
+        // Report active profile count and configuration snapshot for telemetry — at launch,
+        // and again whenever telemetry is switched on while the app runs.
+        recordConfigurationSnapshot()
+        telemetryWasEnabled = SyncTraySettings.telemetryEnabled
+        setupTelemetryOptInObserver()
         startSessionHeartbeat()
         refreshCacheOnlyExcludeLists()
         startMountStateMonitor()
@@ -1554,6 +1564,61 @@ final class SyncManager: ObservableObject {
             self.pendingReinstallRetryScheduled.remove(profileId)
             self.retryPendingExternalReinstallIfNeeded(for: profileId)
         }
+    }
+
+    // MARK: - Failure Notifications
+
+    /// A muted profile still gets one notification once this many runs in a row have failed.
+    nonisolated static let mutedFailureNotifyThreshold = 3
+
+    /// Whether a failed run sends the "Sync failed" notification. Muting silences change
+    /// notices, not a profile that is broken: a muted profile is told once per failing streak,
+    /// when it reaches `mutedFailureNotifyThreshold` failed runs in a row (#112 — one profile
+    /// failed every run for 10+ hours, muted, and its user was never told).
+    nonisolated static func notifiesSyncFailure(
+        muted: Bool,
+        consecutiveFailedRuns: Int,
+        threshold: Int = mutedFailureNotifyThreshold
+    ) -> Bool {
+        !muted || consecutiveFailedRuns == threshold
+    }
+
+    /// The muted profile's notification: why it was sent anyway first — a banner truncates
+    /// the end, and rclone's error can be long — then the usual failure text.
+    nonisolated static func mutedRepeatedFailureNotice(_ text: String, consecutiveFailedRuns: Int) -> String {
+        "Notifications are muted for this profile, but its last \(consecutiveFailedRuns) syncs all failed. \(text)"
+    }
+
+    // MARK: - Telemetry Opt-In
+
+    /// True when telemetry has just been switched on.
+    nonisolated static func telemetryJustEnabled(wasEnabled: Bool, isEnabled: Bool) -> Bool {
+        !wasEnabled && isEnabled
+    }
+
+    /// The configuration snapshot launch records: the enabled-profile count, the
+    /// "Configuration snapshot" log and one "Profile configuration" log per profile.
+    func recordConfigurationSnapshot() {
+        TelemetryService.shared.recordProfileCount(profileStore.enabledProfiles.count)
+        TelemetryService.shared.recordAllProfileConfigurations(profileStore.profiles)
+    }
+
+    /// Telemetry switched on while the app runs — the Settings toggle, the opt-in banner, the
+    /// setup wizard, or a `settings.json` edit such as `synctray telemetry on`, which the app
+    /// applies in-process: record the configuration snapshot launch would have. It used to
+    /// be recorded only at launch, so an install that opted in mid-session sent no profile
+    /// configuration until its next launch, and its failures could not be diagnosed (#112).
+    private func setupTelemetryOptInObserver() {
+        NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                let isEnabled = SyncTraySettings.telemetryEnabled
+                let justEnabled = Self.telemetryJustEnabled(wasEnabled: self.telemetryWasEnabled, isEnabled: isEnabled)
+                self.telemetryWasEnabled = isEnabled
+                if justEnabled { self.recordConfigurationSnapshot() }
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Auto-Fix
@@ -3182,6 +3247,7 @@ final class SyncManager: ObservableObject {
             // shared log file, not necessarily the run that holds the token.
             lastHandledSyncFailureAt[profileId] = nil
             lastSyncFailureAutoFix[profileId] = nil
+            consecutiveFailedRuns[profileId] = nil
             // Any success, the auto-fix resync's included, ends the backoff's window: it exists
             // for a resync that itself fails back-to-back. Kept across a resync success, it
             // gave up as `gave_up_backoff` on a 1–2 minute interval before
@@ -3347,7 +3413,12 @@ final class SyncManager: ObservableObject {
                 profileErrors[profileId] = msg
             }
             let errorDescription = profileErrors[profileId] ?? message ?? "Exit code \(exitCode)"
-            if !isNotificationsMuted(for: profileId) {
+            // Counted only here, past the repeated-end-line check above, so one failed run is
+            // one failure. Any success resets it.
+            let failedRuns = (consecutiveFailedRuns[profileId] ?? 0) + 1
+            consecutiveFailedRuns[profileId] = failedRuns
+            let muted = isNotificationsMuted(for: profileId)
+            if Self.notifiesSyncFailure(muted: muted, consecutiveFailedRuns: failedRuns) {
                 // A macOS privacy denial gets a sentence the user can act on instead of
                 // rclone's raw error; the profile's error banner offers the fixes.
                 let blockedSummary = profile.flatMap {
@@ -3361,7 +3432,7 @@ final class SyncManager: ObservableObject {
                     .map { "\($0) \(blockedAction)" }
                     ?? "Sync failed: \(errorDescription)"
                 notificationService.notifySyncError(
-                    notificationText,
+                    muted ? Self.mutedRepeatedFailureNotice(notificationText, consecutiveFailedRuns: failedRuns) : notificationText,
                     profileId: profileId,
                     profileName: profile?.name
                 )
