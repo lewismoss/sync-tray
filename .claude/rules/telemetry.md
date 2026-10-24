@@ -115,6 +115,18 @@ The span exports only when it ends, so a long run is otherwise invisible until i
 the heartbeat's `Sync progress` log (below) covers the time in between and carries the open
 span's context.
 
+**A failed run is counted once.** A failed bisync reports its end twice: rclone's "Failed to
+bisync: …" notice, then the wrapper's "Bisync failed with exit code N" (sync script and
+auto-fix resync) — each a `.syncFailed`. `recordSyncFailed` therefore records nothing for a
+failure that repeats one recorded for the same profile within
+`TelemetryService.duplicateSyncFailureWindow` (15 s), unless a run started or a success was
+recorded in between (`isDuplicateSyncFailure`, pure). Without it,
+`synctray.sync.completed{sync.result=failure}` and `synctray.sync.errors` counted every failed
+bisync twice and `synctray.sync.duration` got a second, 0 s sample. Force Sync and the profile
+editor's resync log no start and report a failure once (Force Sync's own exit line has no
+timestamp, so it is never parsed); for them the window only bounds how soon after another
+failure theirs would be dropped. Covered by `ConfigSelfTest` AC-TS6.
+
 ## Per-profile Heartbeat Logs
 
 The 5-minute session heartbeat (`SyncManager.startSessionHeartbeat`) emits the aggregate
