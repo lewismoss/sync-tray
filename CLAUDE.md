@@ -13,7 +13,7 @@ SyncTray is a macOS menu bar application that provides Google Drive-style backgr
 - **Live progress tracking**: Parses rclone JSON logs for real-time transfer progress
 - **macOS notifications**: Batch notifications for file changes with "Open Directory" action
 - **Fallback remote**: Automatic failover to an alternative remote when the primary is unreachable
-- **Auto-fix sync issues**: Automatically runs `--resync` recovery when bisync detects an out-of-sync state (app-wide setting, default ON). Skipped when the profile's external drive is unmounted — a `--resync` against a missing/empty local path can't safely fix anything, so the profile is left in `.driveNotMounted` and resumes normally once the drive reconnects. Gated by the single-run guard (Critical Rule 8) — it never fires while another run already holds the profile's lock.
+- **Auto-fix sync issues**: Automatically runs `--resync` recovery when bisync detects an out-of-sync state (app-wide setting, default ON). Skipped when the profile's external drive is unmounted — a `--resync` against a missing/empty local path can't safely fix anything, so the profile is left in `.driveNotMounted` and resumes normally once the drive reconnects. Gated by the single-run guard (Critical Rule 8) — it never fires while another run already holds the profile's lock; when that lock belongs to the failing run itself (its script still exiting), it retries once after 5 s. Stops after `AutoFixRecurrence.limit` (2) **recurrences** — an out-of-sync failure when the last run to succeed was the auto-fix resync itself — and leaves the profile in error with the check-sync file rclone named (`Auto-fix stopped: …`), plus one notification sent even when the profile is muted. The auto-fix resync's own success clears only the backoff's attempt list (the backoff catches a resync that itself fails back-to-back); suppression and the recurrence count reset only on a normal success. The resync (like the editor's) splits `additionalRcloneFlags` exactly as the script does (`SyncSetupService.splitAdditionalFlags`, checked against the script by AC-AF2), so it runs the same filters as the scheduled bisync. Covered by AC-AF1.
 
 ### Sync Modes
 
@@ -1570,6 +1570,12 @@ private var autoFixSuppressed: Set<UUID> = []          // profiles where auto-fi
 // One failed run, handled once (in-memory, cleared on a run start or a success):
 private var lastHandledSyncFailureAt: [UUID: Date] = [:]
 private var lastSyncFailureAutoFix: [UUID: AutoFixOutcome] = [:]
+// Resyncs that succeed but don't stick (AutoFixRecurrence; cleared by a NORMAL success):
+private var autoFixResyncRunning: Set<UUID> = []       // current run is the auto-fix resync
+private var autoFixResyncSucceeded: Set<UUID> = []     // last success was the auto-fix resync
+private var autoFixRecurrences: [UUID: Int] = [:]
+private var autoFixGaveUpRecurring: Set<UUID> = []
+private var lastCheckSyncMismatch: [UUID: String] = [:] // "Path1 file not found in Path2: <file>", app-only
 ```
 
 This allows independent state tracking per profile while maintaining a single source of truth.
@@ -1585,11 +1591,13 @@ recovery run (Force Sync, the editor's resync, Smart Fix, …) logs no start lin
 the failure's second end line is still to come. The repeat sends no notification and records
 nothing; it only (1) tries auto-fix again when the first failure's attempt was refused as
 `blockedAlreadyRunning` (rclone's notice is read while the script still holds its run lock, and
-the script writes its own line as it exits), (2) replaces the exit code of an error still
+the script writes its own line as it exits — and when that attempt is refused too, because the
+script had not exited yet, `scheduleAutoFixLockRetryIfRefused` tries once more 5 s later, for
+that same failure only), (2) replaces the exit code of an error still
 shown with the script's real one (rclone's notice carries none, so it parses as 1), and (3)
 retries a deferred external reinstall (`retryPendingExternalReinstallIfNeeded`), so an edit
 deferred between the two end lines is not left until the next run ends. Covered by
-`ConfigSelfTest` AC-SF1.
+`ConfigSelfTest` AC-SF1; the 5 s lock retry by AC-AF1.
 
 ### @MainActor Thread Safety
 
