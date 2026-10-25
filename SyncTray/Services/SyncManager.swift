@@ -14,6 +14,67 @@ enum ExclusiveRunSource: String {
     case autoFix = "auto_fix"
 }
 
+/// What one `SyncManager.triggerAutoFix` call did. The `.syncFailed` handler keeps the
+/// outcome for the failure it handled, so the same run's second end line can tell whether
+/// that run's auto-fix still has to start (`SyncManager.syncFailureHandling`).
+enum AutoFixOutcome: Equatable {
+    /// Auto-fix is off, the profile is paused, or it is not a bisync profile.
+    case notApplicable
+    case skippedDriveNotMounted
+    /// The single-run guard refused: a run (often the failing run itself, still exiting)
+    /// holds the profile's lock.
+    case blockedAlreadyRunning
+    /// Backoff already gave up on this profile; nothing was attempted.
+    case suppressed
+    case gaveUpBackoff
+    /// Auto-fix stopped because its resyncs did not stick (`AutoFixRecurrence`).
+    case gaveUpRecurring
+    case triggered
+}
+
+/// Detects an auto-fix loop that never converges (#123): the auto-fix `--resync` succeeds,
+/// and the next normal bisync fails the same check-sync again, run after run. The 5-minute
+/// backoff never caught it, because the attempts are a scheduled interval apart, and every
+/// resync success used to reset it.
+///
+/// A recurrence is an out-of-sync failure when the last run to succeed was an auto-fix resync
+/// (no normal success since). After `limit` recurrences auto-fix stops for the profile and the
+/// profile stays in error, with the file bisync reported, until a normal bisync succeeds.
+/// Pure and actor-free, so the self-test can drive it.
+enum AutoFixRecurrence {
+    static let limit = 2
+
+    /// The recurrence count after an out-of-sync failure, and whether auto-fix gives up.
+    static func next(
+        previous: Int,
+        resyncSucceededSinceLastFailure: Bool,
+        limit: Int = AutoFixRecurrence.limit
+    ) -> (count: Int, giveUp: Bool) {
+        guard resyncSucceededSinceLastFailure else { return (previous, false) }
+        let count = previous + 1
+        return (count, count >= limit)
+    }
+
+    /// The profile's error once auto-fix has given up. `mismatch` is the last check-sync
+    /// line rclone logged, with the file it names; shown in the app only, never sent.
+    static func errorMessage(recurrences: Int, mismatch: String?) -> String {
+        let summary = "Auto-fix stopped: a resync succeeded \(recurrences) times, but each time the next sync was out of sync again."
+        guard let mismatch else {
+            return summary + " Check this profile's sync log for the file that differs, then run Fix Sync Issues."
+        }
+        return summary + " rclone reports \"\(mismatch)\". Fix or exclude that file, then run Fix Sync Issues."
+    }
+
+    /// rclone names the mismatched file only in its JSON line's `object`: "Path1 file not
+    /// found in Path2" plus that file, or just `message` when the line has no object.
+    static func mismatchDescription(message: String, rawLine: String) -> String {
+        guard let data = rawLine.data(using: .utf8),
+              let entry = try? JSONDecoder().decode(RcloneLogEntry.self, from: data),
+              let object = entry.object, !object.isEmpty else { return message }
+        return "\(message): \(object)"
+    }
+}
+
 /// Proof that a caller holds the exclusive run slot for `profileId`. Only the
 /// exact token `begin` handed out can `end` it — a superseded or foreign token
 /// (e.g. a very late callback from a run that was already dropped by the
@@ -105,6 +166,29 @@ struct ExclusiveRunRegistry {
     func isActive(_ profileId: UUID) -> Bool {
         active[profileId] != nil
     }
+}
+
+/// What the 5-minute heartbeat needs to know about one profile, captured on the main actor
+/// so the lock reads and `ps` can run off it (`SyncManager.profileHeartbeatReports`).
+struct ProfileHeartbeatSnapshot {
+    let profile: SyncProfile
+    let state: SyncState
+    let isPaused: Bool
+    /// `ExclusiveRunRegistry.isActive` — main-actor state, so captured rather than read later.
+    let registryActive: Bool
+    /// The profile's stored error (`profileErrors`), categorized only — never sent as text.
+    let storedError: String?
+    let progress: SyncProgress?
+    /// When the app processed this run's `.syncStarted` (`syncStartTimes`), if it did.
+    let runStartedAt: Date?
+}
+
+/// The heartbeat's per-profile telemetry, computed off the main actor and emitted on it.
+struct ProfileHeartbeatReports {
+    /// Live Two-Way / One-Way runs — one `Sync progress` log each.
+    var progress: [ProfileHeartbeatSnapshot] = []
+    /// Enabled profiles — one `Profile status` log each.
+    var statuses: [ProfileStatusReport] = []
 }
 
 @MainActor
@@ -204,6 +288,29 @@ final class SyncManager: ObservableObject {
     /// mount monitor's 5s cadence, so the cooldown outlives a couple of ticks — a brief gap in
     /// the app's reads doesn't thrash the warm back on and straight off again.
     static let warmAutoPauseCooldown: TimeInterval = 30
+
+    /// Mount-interruption telemetry (CLAUDE.md "Mount interruption telemetry"): the
+    /// responsiveness probe state per mounted Stream profile (`MountStallProbe`).
+    private var mountStallProbes: [UUID: MountStallProbe] = [:]
+    /// Start of a confirmed unexpected drop per profile, cleared when the volume returns
+    /// (outcome `recovered`) or the profile is unmounted, disabled or removed (`unmounted`).
+    private var mountDropStartedAt: [UUID: Date] = [:]
+    /// Profiles whose mount-table disappearance is waiting for `MountDropClassifier.confirmDelay`
+    /// before it is classified, so one disappearance schedules one check.
+    private var pendingMountDropChecks: Set<UUID> = []
+    /// Duration of a stall that ended because the volume left the mount table, held until the
+    /// drop classification decides its outcome: `dropped` for an unexpected drop, `unmounted`
+    /// for a deliberate unmount (pause, reinstall, Cache Only switch).
+    private var pendingStallEndDurations: [UUID: TimeInterval] = [:]
+    /// Identifies the outstanding responsiveness probe per profile. A probe whose state was
+    /// closed (and maybe replaced) while its call was still blocked carries a stale token,
+    /// so its late return is ignored instead of closing a later probe's stall.
+    private var mountProbeTokens: [UUID: UUID] = [:]
+    /// Where the responsiveness probes run. Concurrent, and off the GCD global pool, because
+    /// a probe on a hung hard NFS mount blocks its thread until the server answers; the
+    /// one-outstanding-probe-per-profile rule in `MountStallProbe` bounds the threads.
+    private let mountProbeQueue = DispatchQueue(
+        label: "com.synctray.mount-responsiveness-probe", qos: .utility, attributes: .concurrent)
 
     /// In-flight warming tasks per profile, kept so a warm run can be cancelled when the
     /// cache is cleared, the profile is unmounted, or a new run supersedes it. Without this,
@@ -375,8 +482,38 @@ final class SyncManager: ObservableObject {
     private var autoFixAttempts: [UUID: [Date]] = [:]
 
     /// Profiles where auto-fix has been suppressed due to repeated failures.
-    /// Reset when the profile completes a successful sync.
+    /// Reset when the profile completes a normal (non-auto-fix) successful sync.
     private var autoFixSuppressed: Set<UUID> = []
+
+    /// When `processLogEvent` last handled a genuine `.syncFailed` for a profile, and what
+    /// that failure's auto-fix attempt did. One failed bisync reports its end twice, so these
+    /// tell the run's second end line apart from a new failure (`syncFailureHandling`).
+    /// Cleared when a run starts or succeeds.
+    private var lastHandledSyncFailureAt: [UUID: Date] = [:]
+    private var lastSyncFailureAutoFix: [UUID: AutoFixOutcome] = [:]
+
+    /// An auto-fix resync that succeeds while the next bisync fails the same way again (#123,
+    /// `AutoFixRecurrence`). A normal (non-auto-fix) success clears all of these.
+    /// Profiles whose current run is the auto-fix resync (its start line is
+    /// `SyncLogPatterns.autoFixResyncStartLine`).
+    private var autoFixResyncRunning: Set<UUID> = []
+    /// Profiles whose last successful run was an auto-fix resync.
+    private var autoFixResyncSucceeded: Set<UUID> = []
+    private var autoFixRecurrences: [UUID: Int] = [:]
+    /// Profiles where auto-fix stopped because its resyncs did not stick.
+    private var autoFixGaveUpRecurring: Set<UUID> = []
+    /// The current run's last check-sync mismatch, with the file it names (local UI only).
+    private var lastCheckSyncMismatch: [UUID: String] = [:]
+    /// Profiles with a delayed auto-fix retry pending (`scheduleAutoFixLockRetryIfRefused`).
+    private var autoFixLockRetryScheduled: Set<UUID> = []
+
+    /// Failed runs in a row per profile since its last success (in-memory). Lets a muted
+    /// profile that keeps failing still tell the user once (`notifiesSyncFailure`).
+    private var consecutiveFailedRuns: [UUID: Int] = [:]
+
+    /// Whether telemetry was on the last time `UserDefaults` changed, so turning it on while
+    /// the app runs can be told apart (`setupTelemetryOptInObserver`).
+    private var telemetryWasEnabled = SyncTraySettings.telemetryEnabled
 
     /// Single-run guard (CLAUDE.md "One Run Per Profile"): enforces one exclusive
     /// run per profile across every launch path (reinstall resync, Resync, Smart
@@ -398,6 +535,11 @@ final class SyncManager: ObservableObject {
     /// The time window (seconds) within which consecutive auto-fix failures trigger backoff suppression.
     private let autoFixBackoffWindow: TimeInterval = 5 * 60  // 5 minutes
 
+    /// How long after an auto-fix attempt refused by a live lock to try once more. The usual
+    /// holder is the failing run itself: its script keeps the lock until it exits, right after
+    /// writing its last line.
+    private let autoFixLockRetryDelay: TimeInterval = 5
+
     private let maxRecentChanges = 20
 
     init(profileStore: ProfileStore? = nil) {
@@ -412,9 +554,11 @@ final class SyncManager: ObservableObject {
         checkInitialState()
         startWatchingAllProfiles()
         updateMountStates()  // Initialize mount states for mount mode profiles
-        // Report active profile count and configuration snapshot for telemetry
-        TelemetryService.shared.recordProfileCount(self.profileStore.enabledProfiles.count)
-        TelemetryService.shared.recordAllProfileConfigurations(self.profileStore.profiles)
+        // Report active profile count and configuration snapshot for telemetry — at launch,
+        // and again whenever telemetry is switched on while the app runs.
+        recordConfigurationSnapshot()
+        telemetryWasEnabled = SyncTraySettings.telemetryEnabled
+        setupTelemetryOptInObserver()
         startSessionHeartbeat()
         refreshCacheOnlyExcludeLists()
         startMountStateMonitor()
@@ -424,6 +568,14 @@ final class SyncManager: ObservableObject {
         removeAllLegacyOfflineLinks()  // Clean up any (Offline) symlink left by the retired feature
         setupFinderSyncIPC()
         updateAppGroupMountPaths()
+        // Apply settings.json keys edited outside the app while it was closed, before the
+        // rewrite below discards them — never a key the app changed itself (the telemetry
+        // banner), and never launchAtLogin, which System Settings may have changed since.
+        let changedOutsideApp = AppSettingsFileStore.keysChangedSinceLastWrite(
+            file: AppSettingsFileStore.readSettingsFileJSON() ?? [:],
+            snapshot: AppSettingsFileStore.lastWrittenSnapshot()
+        )
+        applySettingsFile(includeLoginItem: false, onlyKeys: changedOutsideApp)
         refreshSettingsFile()
         startConfigWatcher()
     }
@@ -756,6 +908,10 @@ final class SyncManager: ObservableObject {
             do {
                 try setupService.unmount(profile: profile)
                 await MainActor.run {
+                    // An open drop or stall ends here, by request (outcome `unmounted`).
+                    // Only after the unmount succeeded: a hung volume that a failed forced
+                    // unmount left mounted keeps its stall open and reported once.
+                    closeMountInterruptions(only: profile.id)
                     profileMountStates[profile.id] = .unmounted
                     TelemetryService.shared.recordMountOperation(
                         profileId: profile.id,
@@ -1036,9 +1192,10 @@ final class SyncManager: ObservableObject {
         // "Don't Sync" patterns AND "Sync Only These Folders" selective folders, also
         // ORTHOGONAL to `action`: a changed `syncExcludePatterns`/`syncIncludeFolders` yields
         // `action == .none` (the script re-reads the filter file every run), so rewrite the
-        // file here, with the same gate and the same outcome recording as the in-app editors
-        // (`updateSyncExcludePatterns` / `updateSyncIncludeFolders`). A failed write goes to
-        // `syncFilterErrors`, not `profileErrors`: every sync run clears `profileErrors`,
+        // file here, with the same gate and the same outcome recording as the in-app Save
+        // path (`ProfileDetailView.applyFilterSaveAndFollowUp` / `updateSyncIncludeFolders`).
+        // A failed write goes to `syncFilterErrors`, not `profileErrors`: every sync run clears
+        // `profileErrors`,
         // which would make the patterns look applied again. A bisync profile whose compiled
         // include rules actually change picks up its own resync-pending marker inside the
         // write — never a reinstall.
@@ -1106,11 +1263,49 @@ final class SyncManager: ObservableObject {
         startWarm(for: profileId, dirs: dirs, trigger: trigger)
     }
 
-    /// Apply an external edit to `settings.json`. Safe keys apply directly;
-    /// `launchAtLogin` goes through `SettingsReconciler`'s ISOLATED path so an
-    /// `SMAppService` failure can never corrupt anything else.
+    /// Apply an external edit to `settings.json` — only the keys changed since the
+    /// app last wrote the file (`keysChangedSinceLastWrite`, the same filter launch
+    /// uses), so a stale neighbour key the CLI's merge write carries along never
+    /// reverts a value the app changed without rewriting the file (the telemetry
+    /// banner, a login item toggled in System Settings). With no snapshot (the
+    /// launch write failed) every valid key counts as changed, so a hand edit is
+    /// never ignored. Safe keys apply directly; `launchAtLogin` goes through
+    /// `SettingsReconciler`'s ISOLATED path so an `SMAppService` failure can never
+    /// corrupt anything else. The file and snapshot are then rewritten to match
+    /// (a self-noted write, so the watcher ignores it).
     func applyExternalSettingsEdit() {
-        let safeSettings = AppSettingsFileStore.readSafeSettings()
+        // An unreadable or half-written file applies nothing — and isn't
+        // overwritten, so a hand edit with a typo is never lost.
+        guard let file = AppSettingsFileStore.readSettingsFileJSON() else { return }
+        let changed = AppSettingsFileStore.keysChangedSinceLastWrite(
+            file: file,
+            snapshot: AppSettingsFileStore.lastWrittenSnapshot() ?? [:]
+        )
+        applySettingsFile(includeLoginItem: true, onlyKeys: changed)
+        refreshSettingsFile()
+        TelemetryService.shared.recordExternalConfigEdit(kind: "settings")
+    }
+
+    /// Apply every valid key in `settings.json` to the app's settings — or, with
+    /// `onlyKeys`, just those keys. Keys that are absent or invalid are left
+    /// unchanged.
+    private func applySettingsFile(includeLoginItem: Bool, onlyKeys: Set<String>? = nil) {
+        var safeSettings = AppSettingsFileStore.readSafeSettings()
+        if !includeLoginItem { safeSettings[.launchAtLogin] = nil }
+        var stringSettings = AppSettingsFileStore.readStringSettings()
+        if let onlyKeys {
+            safeSettings = safeSettings.filter { onlyKeys.contains($0.key.rawValue) }
+            stringSettings = stringSettings.filter { onlyKeys.contains($0.key.rawValue) }
+        }
+
+        // String keys are the `@AppStorage` keys `SyncTrayApp` and
+        // `AppSettingsView` read, so writing them redraws the menu bar icon.
+        // Set even when the value looks unchanged: the CLI writes UserDefaults
+        // from its own process, and this in-process write is what notifies
+        // `@AppStorage`.
+        for (key, value) in stringSettings {
+            UserDefaults.standard.set(value, forKey: key.rawValue)
+        }
 
         SettingsReconciler.apply(
             safeSettings: safeSettings,
@@ -1139,8 +1334,6 @@ final class SyncManager: ObservableObject {
                 self.objectWillChange.send()
             }
         )
-
-        TelemetryService.shared.recordExternalConfigEdit(kind: "settings")
     }
 
     /// Get state for a specific profile
@@ -1255,9 +1448,21 @@ final class SyncManager: ObservableObject {
         }
         // A new run: an earlier abort's trailing suppression must not hide its failures.
         abortSuppressUntil[profile.id] = nil
-        // Explicit setup/recovery runs also establish the next scheduled due time.
-        if !profile.isMountMode {
-            do { try SyncSetupService.recordSyncAttempt(for: profile) }
+        // Nor may the last run's failure: Force Sync and the editor's resync log no start
+        // line, so without this a failure of theirs within `duplicateSyncFailureWindow` of the
+        // last one handled was dropped as that run's repeated end line (#122). Not auto-fix:
+        // it starts from inside that failure's own handling, before the run's second end line
+        // arrives, and its start line resets this anyway.
+        if source != .autoFix {
+            lastHandledSyncFailureAt[profile.id] = nil
+            lastSyncFailureAutoFix[profile.id] = nil
+            TelemetryService.shared.forgetLastSyncFailure(profileId: profile.id)
+        }
+        // Explicit setup/recovery starts establish the cadence; auto-fix belongs
+        // to the attempt already in progress and must not advance it again.
+        if source != .autoFix {
+            let current = profileStore.profile(for: profile.id) ?? profile
+            do { try SyncSetupService.recordSyncAttempt(for: current) }
             catch { SyncTraySettings.debugLog("Could not record sync attempt: \(error)") }
         }
         return token
@@ -1368,37 +1573,134 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    // MARK: - Failure Notifications
+
+    /// A muted profile still gets one notification once this many runs in a row have failed.
+    nonisolated static let mutedFailureNotifyThreshold = 3
+
+    /// Whether a failed run sends the "Sync failed" notification. Muting silences change
+    /// notices, not a profile that is broken: a muted profile is told once per failing streak,
+    /// when it reaches `mutedFailureNotifyThreshold` failed runs in a row (#112 — one profile
+    /// failed every run for 10+ hours, muted, and its user was never told).
+    nonisolated static func notifiesSyncFailure(
+        muted: Bool,
+        consecutiveFailedRuns: Int,
+        threshold: Int = mutedFailureNotifyThreshold
+    ) -> Bool {
+        !muted || consecutiveFailedRuns == threshold
+    }
+
+    /// The muted profile's notification: why it was sent anyway first — a banner truncates
+    /// the end, and rclone's error can be long — then the usual failure text.
+    nonisolated static func mutedRepeatedFailureNotice(_ text: String, consecutiveFailedRuns: Int) -> String {
+        "Notifications are muted for this profile, but its last \(consecutiveFailedRuns) syncs all failed. \(text)"
+    }
+
+    // MARK: - Telemetry Opt-In
+
+    /// True when telemetry has just been switched on.
+    nonisolated static func telemetryJustEnabled(wasEnabled: Bool, isEnabled: Bool) -> Bool {
+        !wasEnabled && isEnabled
+    }
+
+    /// The configuration snapshot launch records: the enabled-profile count, the
+    /// "Configuration snapshot" log and one "Profile configuration" log per profile.
+    func recordConfigurationSnapshot() {
+        TelemetryService.shared.recordProfileCount(profileStore.enabledProfiles.count)
+        TelemetryService.shared.recordAllProfileConfigurations(profileStore.profiles)
+    }
+
+    /// Telemetry switched on while the app runs — the Settings toggle, the opt-in banner, the
+    /// setup wizard, or a `settings.json` edit such as `synctray telemetry on`, which the app
+    /// applies in-process: record the configuration snapshot launch would have. It used to
+    /// be recorded only at launch, so an install that opted in mid-session sent no profile
+    /// configuration until its next launch, and its failures could not be diagnosed (#112).
+    private func setupTelemetryOptInObserver() {
+        NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                let isEnabled = SyncTraySettings.telemetryEnabled
+                let justEnabled = Self.telemetryJustEnabled(wasEnabled: self.telemetryWasEnabled, isEnabled: isEnabled)
+                self.telemetryWasEnabled = isEnabled
+                if justEnabled { self.recordConfigurationSnapshot() }
+            }
+            .store(in: &cancellables)
+    }
+
     // MARK: - Auto-Fix
+
+    /// What `processLogEvent` does with a genuine `.syncFailed` (one that is not an aborted
+    /// run's, a rejected concurrent run's, or a transient one).
+    enum SyncFailureHandling: Equatable {
+        /// A new failure: set the error, notify, record telemetry, try auto-fix.
+        case handle
+        /// The same run's second end line, and the auto-fix the first one tried was refused
+        /// because a run still held the profile's lock: try auto-fix again, on top of what
+        /// `.ignore` does.
+        case retryAutoFixOnly
+        /// The same run's second end line: the first one already did everything. The repeat
+        /// only corrects the exit code of an error still shown and retries a deferred external
+        /// reinstall.
+        case ignore
+    }
+
+    /// One failed bisync reports its end twice: rclone's "Failed to bisync: …" notice, then
+    /// the wrapper's "Bisync failed with exit code N" (the sync script and the auto-fix resync
+    /// both write it). Handling both used to send two critical "Sync failed" notifications,
+    /// and set the profile back to an error over a resync auto-fix had just started.
+    ///
+    /// A failure is the same run's when it comes within
+    /// `TelemetryService.duplicateSyncFailureWindow` of the one handled before it, with no run
+    /// started, no success, and no app-launched recovery run in between (each clears
+    /// `lastHandledAt`; `beginExclusiveRun` does it for every source but auto-fix) — the rule
+    /// `TelemetryService.recordSyncFailed` counts by, so the app and its telemetry agree on
+    /// what one failed run is.
+    ///
+    /// rclone's notice is read while the sync script still holds the run lock, so the
+    /// auto-fix it triggers is often refused as `blockedAlreadyRunning`; the script's own line
+    /// is written as it exits. That repeat still gets one more auto-fix attempt.
+    nonisolated static func syncFailureHandling(
+        lastHandledAt: Date?,
+        autoFixOutcome: AutoFixOutcome?,
+        now: Date
+    ) -> SyncFailureHandling {
+        guard TelemetryService.isDuplicateSyncFailure(lastFailureAt: lastHandledAt, now: now) else {
+            return .handle
+        }
+        return autoFixOutcome == .blockedAlreadyRunning ? .retryAutoFixOnly : .ignore
+    }
 
     /// Attempt an automatic --resync recovery for the given profile.
     ///
     /// Called from `processLogEvent` when the auto-fix setting is enabled and the
     /// profile enters an out-of-sync error state. Implements a backoff guard:
     /// if the same profile triggers auto-fix **twice within 5 minutes**, auto-fix
-    /// is suppressed for that profile until a successful sync clears the suppression.
+    /// is suppressed for that profile until a normal (non-auto-fix) successful sync clears the
+    /// suppression. A resync that succeeds while the next bisync fails the same way again is a
+    /// recurrence (`AutoFixRecurrence`); after `AutoFixRecurrence.limit` of them auto-fix stops.
     /// Note: suppression fires on the 2nd trigger (not the 2nd confirmed failure),
     /// because confirming failure requires the log-watcher round-trip.
     ///
     /// Reuses the same rclone bisync --resync process that `ProfileDetailView.runResync()`
     /// runs, but without UI state (the progress bar / output panel in the settings
     /// view is driven by the profile state change visible via `@Published profileStates`).
-    func triggerAutoFix(for profile: SyncProfile) {
-        // Schedule-only profiles never launch automatic recovery between due times.
-        guard profile.syncOnLocalChanges else { return }
+    @discardableResult
+    func triggerAutoFix(for profile: SyncProfile) -> AutoFixOutcome {
         let profileId = profile.id
 
         // Respect the global setting
-        guard SyncTraySettings.autoFixSyncIssues else { return }
+        guard SyncTraySettings.autoFixSyncIssues else { return .notApplicable }
 
         // Skip paused profiles — auto-fix should never fire while the user has sync paused
         guard !isPaused(for: profileId) else {
             SyncTraySettings.debugLog("Auto-fix skipped: profile '\(profile.name)' is paused")
-            return
+            return .notApplicable
         }
 
         // Auto-fix only applies to bisync mode — one-way sync and mount profiles do not
         // produce "out of sync" errors and have no --resync concept.
-        guard profile.syncMode == .bisync else { return }
+        guard profile.syncMode == .bisync else { return .notApplicable }
 
         // Never auto-resync against an unmounted external drive. The local path is missing
         // or replaced by an empty mount point, so a --resync would run against an empty/partial
@@ -1415,7 +1717,7 @@ final class SyncManager: ObservableObject {
             )
             profileStates[profileId] = .driveNotMounted
             updateAggregateState()
-            return
+            return .skippedDriveNotMounted
         }
 
         // Skip if a resync is already in-flight for this profile, or if another
@@ -1430,16 +1732,51 @@ final class SyncManager: ObservableObject {
                 profileName: profile.name,
                 result: "blocked_already_running"
             )
-            return
+            return .blockedAlreadyRunning
         }
 
         // Respect per-profile suppression (backoff guard) — return silently after the first
         // transition notification so the user is not spammed on every subsequent syncFailed event.
         guard !autoFixSuppressed.contains(profileId) else {
             SyncTraySettings.debugLog("Auto-fix suppressed (backoff) for '\(profile.name)'")
+            // Every later failure would show rclone's bare out-of-sync text again; keep the
+            // explanation (and the file) while auto-fix stays stopped for a recurring loop.
+            if autoFixGaveUpRecurring.contains(profileId) {
+                profileErrors[profileId] = AutoFixRecurrence.errorMessage(
+                    recurrences: autoFixRecurrences[profileId] ?? AutoFixRecurrence.limit,
+                    mismatch: lastCheckSyncMismatch[profileId])
+            }
             SyncRunLock.releaseIfOwned(path: profile.lockFilePath, ownTokens: [token.placeholder])
             endExclusiveRun(token)
-            return
+            return .suppressed
+        }
+
+        // A resync that worked but did not stick (#123): the last run to succeed was an
+        // auto-fix resync, and the bisync after it failed out of sync again. The backoff below
+        // never sees this loop — its attempts are a scheduled interval apart.
+        let resyncDidNotStick = autoFixResyncSucceeded.remove(profileId) != nil
+        let recurrence = AutoFixRecurrence.next(
+            previous: autoFixRecurrences[profileId] ?? 0,
+            resyncSucceededSinceLastFailure: resyncDidNotStick)
+        autoFixRecurrences[profileId] = recurrence.count
+        if recurrence.giveUp {
+            autoFixSuppressed.insert(profileId)
+            autoFixGaveUpRecurring.insert(profileId)
+            TelemetryService.shared.recordAutoFixTriggered(
+                profileId: profileId,
+                profileName: profile.name,
+                result: "gave_up_recurring"
+            )
+            SyncTraySettings.debugLog(
+                "Auto-fix giving up for '\(profile.name)': \(recurrence.count) resyncs succeeded but did not stick")
+            // The profile stays in error (the failing run already set it) with an explanation
+            // instead of rclone's "run --resync to recover", which auto-fix just stopped doing.
+            profileErrors[profileId] = AutoFixRecurrence.errorMessage(
+                recurrences: recurrence.count, mismatch: lastCheckSyncMismatch[profileId])
+            notificationService.notifyAutoFixGaveUpRecurring(profileId: profileId, profileName: profile.name)
+            SyncRunLock.releaseIfOwned(path: profile.lockFilePath, ownTokens: [token.placeholder])
+            endExclusiveRun(token)
+            return .gaveUpRecurring
         }
 
         // Record the attempt and check backoff threshold
@@ -1463,7 +1800,7 @@ final class SyncManager: ObservableObject {
             notificationService.notifyAutoFixSuppressed(profileId: profileId, profileName: profile.name)
             SyncRunLock.releaseIfOwned(path: profile.lockFilePath, ownTokens: [token.placeholder])
             endExclusiveRun(token)
-            return
+            return .gaveUpBackoff
         }
 
         // Good to go — notify user and start the resync
@@ -1471,7 +1808,7 @@ final class SyncManager: ObservableObject {
         TelemetryService.shared.recordAutoFixTriggered(
             profileId: profileId,
             profileName: profile.name,
-            result: "triggered"
+            result: resyncDidNotStick ? "recurred" : "triggered"
         )
 
         // Post a macOS notification so the user can see what's happening
@@ -1486,6 +1823,29 @@ final class SyncManager: ObservableObject {
 
         Task {
             await performResync(for: profile, token: token)
+        }
+        return .triggered
+    }
+
+    /// When the failure's auto-fix attempt was refused by a live lock, try once more after
+    /// `autoFixLockRetryDelay` — but only for that same failure: a run start or a success in
+    /// between clears `lastHandledSyncFailureAt`. Without this, a failure whose two end lines
+    /// were both read before the sync script exited never started its auto-fix, and the
+    /// profile sat in error until the next scheduled run (#123). One retry per failure.
+    private func scheduleAutoFixLockRetryIfRefused(for profileId: UUID) {
+        guard lastSyncFailureAutoFix[profileId] == .blockedAlreadyRunning,
+              let failureAt = lastHandledSyncFailureAt[profileId],
+              !autoFixLockRetryScheduled.contains(profileId) else { return }
+        autoFixLockRetryScheduled.insert(profileId)
+        DispatchQueue.main.asyncAfter(deadline: .now() + autoFixLockRetryDelay) { [weak self] in
+            guard let self else { return }
+            self.autoFixLockRetryScheduled.remove(profileId)
+            guard self.lastHandledSyncFailureAt[profileId] == failureAt,
+                  self.lastSyncFailureAutoFix[profileId] == .blockedAlreadyRunning,
+                  let storedError = self.profileErrors[profileId],
+                  SyncLogPatterns.isOutOfSyncError(storedError),
+                  let profile = self.profileStore.profile(for: profileId) else { return }
+            self.lastSyncFailureAutoFix[profileId] = self.triggerAutoFix(for: profile)
         }
     }
 
@@ -1613,7 +1973,18 @@ final class SyncManager: ObservableObject {
                     }
 
                     if !additionalFlags.isEmpty {
-                        let extra = additionalFlags.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                        // Split exactly as the sync script splits them (#123): a whitespace
+                        // split broke quoted values and skipped `~` / `$VAR`, so the resync ran
+                        // different filters than the scheduled bisync it was meant to repair.
+                        guard let extra = SyncSetupService.splitAdditionalFlags(additionalFlags) else {
+                            SyncRunLock.releaseIfOwned(path: lockPath, ownTokens: [placeholder])
+                            continuation.resume(throwing: NSError(
+                                domain: "SyncManager",
+                                code: 3,
+                                userInfo: [NSLocalizedDescriptionKey: "additionalRcloneFlags could not be parsed"]
+                            ))
+                            return
+                        }
                         arguments.append(contentsOf: extra)
                     }
 
@@ -1663,7 +2034,7 @@ final class SyncManager: ObservableObject {
                     process.standardOutput = processLog
                     process.standardError = processLog
 
-                    appendLog("Starting bisync (auto-fix --resync)")
+                    appendLog(SyncLogPatterns.autoFixResyncStartLine)
 
                     // Child PID becomes known only after `process.run()`; captured here so the
                     // termination handler can release the lock whichever token it still holds
@@ -1943,6 +2314,47 @@ final class SyncManager: ObservableObject {
         abortTasks[profile.id] = Task { [weak self] in
             await self?.runAbort(for: profile)
         }
+    }
+
+    /// Stop a profile's live run, then start a fresh sync once it has ended — the follow-up a
+    /// confirmed "Stop the Current Sync and Apply?" Save performs after writing the new "Don't
+    /// Sync" filter (plan D7). Joins an abort already in flight rather than starting a second
+    /// one. Reuses `abortSync` only (CLAUDE.md Rule 9): no new signalling to rclone, no agent
+    /// load or unload, no pause, no lock touch — `runSyncScript` already performs the deferred
+    /// agent load and clears `abortSuppressUntil` once the aborted run needed it.
+    func stopRunThenSync(for profile: SyncProfile) {
+        if !isAborting(for: profile.id) {
+            abortSync(for: profile)
+        }
+        let inFlight = abortTasks[profile.id]
+        Task { [weak self] in
+            await inFlight?.value
+            self?.resumeAfterStopRunThenSync(for: profile)
+        }
+    }
+
+    /// The follow-through once `stopRunThenSync`'s abort has finished: start Sync Now only if
+    /// the abort actually ended the run — it can give up after `SyncAbort`'s own timeout, in
+    /// which case nothing is restarted and the already-saved filter simply applies from the
+    /// next run. Re-reads the profile from the store since it may have changed (disabled,
+    /// deleted, edited again) while the abort was in flight.
+    private func resumeAfterStopRunThenSync(for profile: SyncProfile) {
+        // Short-circuits on the lookup, so a deleted profile never reaches `isEnabled`/
+        // `isRunLive` with a stale snapshot — matches this function's own doc comment.
+        guard let latest = profileStore.profile(for: profile.id), latest.isEnabled,
+              !isAborting(for: profile.id), !isRunLive(for: latest) else {
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: profile.id, profileName: profile.name,
+                operation: "apply_sync_filter", syncMode: profile.syncMode.rawValue, result: "not_restarted"
+            )
+            return
+        }
+        clearError(for: profile.id)
+        triggerManualSync(for: latest)
+        TelemetryService.shared.recordProfileLifecycleOperation(
+            profileId: profile.id, profileName: profile.name,
+            operation: "apply_sync_filter", syncMode: profile.syncMode.rawValue, result: "restarted"
+        )
     }
 
     /// Skip the rest of an in-flight abort's graceful wait: SIGTERM the run now (SIGKILL
@@ -2808,6 +3220,16 @@ final class SyncManager: ObservableObject {
             profileStates[profileId] = .syncing
             profileErrors[profileId] = nil  // Clear previous error on new sync
             lastSeenErrorMessage[profileId] = nil  // Clear last seen error
+            // A failure from here on is this new run's, never a repeat of the last one's.
+            lastHandledSyncFailureAt[profileId] = nil
+            lastSyncFailureAutoFix[profileId] = nil
+            // Whether this run is the auto-fix resync decides what its success proves (#123).
+            if SyncLogPatterns.isAutoFixResyncStart(event.rawLine) {
+                autoFixResyncRunning.insert(profileId)
+            } else {
+                autoFixResyncRunning.remove(profileId)
+            }
+            lastCheckSyncMismatch[profileId] = nil
             profileProgress[profileId] = nil  // Reset progress for new sync
             currentSyncChanges[profileId] = []
             syncStartTimes[profileId] = Date()  // Record start time for duration tracking
@@ -2834,13 +3256,31 @@ final class SyncManager: ObservableObject {
             profileProgress[profileId] = nil  // Clear progress when sync completes
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             lastSyncTime = event.timestamp
-            // Successful sync clears backoff suppression for this profile. The
+            // A normal successful sync clears backoff suppression for this profile. The
             // exclusive-run registry is NOT touched here (D1): it is owned and
             // ended only by the run that `beginExclusiveRun`'d it, never by a log
             // event — a log event can come from any process writing this profile's
             // shared log file, not necessarily the run that holds the token.
-            autoFixSuppressed.remove(profileId)
+            lastHandledSyncFailureAt[profileId] = nil
+            lastSyncFailureAutoFix[profileId] = nil
+            consecutiveFailedRuns[profileId] = nil
+            // Any success, the auto-fix resync's included, ends the backoff's window: it exists
+            // for a resync that itself fails back-to-back. Kept across a resync success, it
+            // gave up as `gave_up_backoff` on a 1–2 minute interval before
+            // `AutoFixRecurrence` could reach its limit (review finding on #126).
             autoFixAttempts[profileId] = nil
+            if autoFixResyncRunning.remove(profileId) != nil {
+                // The auto-fix resync worked, but that alone does not show the pair converged:
+                // only a normal bisync succeeding after it does (#123). Keep the suppression
+                // and recurrence state, so a resync that keeps "working" while the next bisync
+                // fails the same way is caught by `AutoFixRecurrence`.
+                autoFixResyncSucceeded.insert(profileId)
+            } else {
+                autoFixSuppressed.remove(profileId)
+                autoFixResyncSucceeded.remove(profileId)
+                autoFixRecurrences[profileId] = nil
+                autoFixGaveUpRecurring.remove(profileId)
+            }
             let changesCount = currentSyncChanges[profileId]?.count ?? 0
             // Report telemetry for successful sync
             let completedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
@@ -2930,11 +3370,48 @@ final class SyncManager: ObservableObject {
                 break
             }
 
+            // A failed bisync reports its end twice (#122). The repeat must not set the error,
+            // notify, or record the failure again — see `syncFailureHandling`.
+            let failureHandledAt = Date()
+            let handling = Self.syncFailureHandling(
+                lastHandledAt: lastHandledSyncFailureAt[profileId],
+                autoFixOutcome: lastSyncFailureAutoFix[profileId],
+                now: failureHandledAt
+            )
+            if handling != .handle {
+                // rclone's notice carries no exit code (parsed as 1); the wrapper's line, written
+                // as the script exits, has the real one. Show it on an error still shown, without
+                // notifying or recording anything again.
+                if exitCode > 0, case .error = profileStates[profileId] {
+                    profileStates[profileId] = .error("Exit code \(exitCode)")
+                }
+                if handling == .retryAutoFixOnly,
+                   let storedError = profileErrors[profileId],
+                   SyncLogPatterns.isOutOfSyncError(storedError),
+                   let currentProfile = profile {
+                    lastSyncFailureAutoFix[profileId] = triggerAutoFix(for: currentProfile)
+                    scheduleAutoFixLockRetryIfRefused(for: profileId)
+                }
+                SyncTraySettings.debugLog(
+                    "Ignoring repeated syncFailed (exit \(exitCode)) for '\(profileName)': this run's failure was already handled")
+                // An external edit deferred between the run's two end lines is applied now,
+                // not only when the next run ends.
+                retryPendingExternalReinstallIfNeeded(for: profileId)
+                break
+            }
+            lastHandledSyncFailureAt[profileId] = failureHandledAt
+            lastSyncFailureAutoFix[profileId] = nil
+            autoFixResyncRunning.remove(profileId)  // the run ended; it did not succeed
+
             profileStates[profileId] = .error("Exit code \(exitCode)")
             profileProgress[profileId] = nil  // Clear progress on failure
             lastSeenErrorMessage[profileId] = nil
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
-            // Report telemetry for failed sync
+            // Report telemetry for failed sync. Categorize from the run's FIRST error
+            // (`profileErrors` keeps the first error of the run, or the first critical one),
+            // not from rclone's closing notice: that notice only says what rclone skipped
+            // because of it ("not deleting files as there were IO errors"), so categorizing
+            // it filed e.g. every macOS privacy denial under "other".
             let failedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
             syncStartTimes[profileId] = nil
             TelemetryService.shared.recordSyncFailed(
@@ -2944,16 +3421,34 @@ final class SyncManager: ObservableObject {
                 duration: failedDuration,
                 filesChanged: currentSyncChanges[profileId]?.count ?? 0,
                 exitCode: exitCode,
-                errorMessage: message ?? profileErrors[profileId]
+                errorMessage: profileErrors[profileId] ?? message,
+                localSyncPath: profile?.localSyncPath
             )
             // Only use the syncFailed message if we don't already have a more specific error
             if profileErrors[profileId] == nil, let msg = message {
                 profileErrors[profileId] = msg
             }
             let errorDescription = profileErrors[profileId] ?? message ?? "Exit code \(exitCode)"
-            if !isNotificationsMuted(for: profileId) {
+            // Counted only here, past the repeated-end-line check above, so one failed run is
+            // one failure. Any success resets it.
+            let failedRuns = (consecutiveFailedRuns[profileId] ?? 0) + 1
+            consecutiveFailedRuns[profileId] = failedRuns
+            let muted = isNotificationsMuted(for: profileId)
+            if Self.notifiesSyncFailure(muted: muted, consecutiveFailedRuns: failedRuns) {
+                // A macOS privacy denial gets a sentence the user can act on instead of
+                // rclone's raw error; the profile's error banner offers the fixes.
+                let blockedSummary = profile.flatMap {
+                    SyncLogPatterns.macOSBlockedAccessSummary(for: errorDescription, localSyncPath: $0.localSyncPath)
+                }
+                // Full Disk Access only helps a privacy denial, so only that one mentions access.
+                let blockedAction = SyncLogPatterns.blockedAccess(in: errorDescription)?.kind == .filePermissions
+                    ? "Open SyncTray to exclude it."
+                    : "Open SyncTray to exclude it or allow access."
+                let notificationText = blockedSummary
+                    .map { "\($0) \(blockedAction)" }
+                    ?? "Sync failed: \(errorDescription)"
                 notificationService.notifySyncError(
-                    "Sync failed: \(errorDescription)",
+                    muted ? Self.mutedRepeatedFailureNotice(notificationText, consecutiveFailedRuns: failedRuns) : notificationText,
                     profileId: profileId,
                     profileName: profile?.name
                 )
@@ -2969,7 +3464,8 @@ final class SyncManager: ObservableObject {
             if let storedError = profileErrors[profileId],
                SyncLogPatterns.isOutOfSyncError(storedError),
                let currentProfile = profile {
-                triggerAutoFix(for: currentProfile)
+                lastSyncFailureAutoFix[profileId] = triggerAutoFix(for: currentProfile)
+                scheduleAutoFixLockRetryIfRefused(for: profileId)
             }
             // The run just ended (failed, but ended) — apply any reinstall an external
             // edit deferred while it was live (review finding).
@@ -3024,6 +3520,13 @@ final class SyncManager: ObservableObject {
             // Track all error messages so we can correlate with syncFailed events
             lastSeenErrorMessage[profileId] = message
 
+            // Keep the file bisync's check-sync names (in the app only — telemetry gets the
+            // category, never the text), for the error shown if auto-fix gives up (#123).
+            if SyncLogPatterns.isCheckSyncMismatch(message) {
+                lastCheckSyncMismatch[profileId] = AutoFixRecurrence.mismatchDescription(
+                    message: message, rawLine: event.rawLine)
+            }
+
             // Transient "all files were changed" error should not be stored as a displayed error
             if SyncLogPatterns.isTransientAllFilesChangedError(message) {
                 break
@@ -3032,7 +3535,8 @@ final class SyncManager: ObservableObject {
             TelemetryService.shared.recordSyncError(
                 profileId: profileId,
                 profileName: profileName,
-                errorMessage: message
+                errorMessage: message,
+                localSyncPath: profile?.localSyncPath
             )
 
             // Prefer critical/actionable errors over file-level errors
@@ -3328,21 +3832,24 @@ final class SyncManager: ObservableObject {
             .map { ($0.id, $0.name, $0.localSyncPath) }
         guard !targets.isEmpty else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let probed: [(UUID, String, Bool)] = targets.map { id, name, mount in
-                (id, name, Self.shouldAutoPauseWarm(lsofOutput: Self.runLsofBusyCheck(mountPoint: mount)))
+            let probed: [(UUID, String, [String])] = targets.map { id, name, mount in
+                (id, name, Self.warmPauseReaders(lsofOutput: Self.runLsofBusyCheck(mountPoint: mount)))
             }
             DispatchQueue.main.async {
                 guard let self else { return }
                 let now = Date()
-                for (id, name, pause) in probed where pause {
+                for (id, name, readers) in probed where !readers.isEmpty {
                     let wasPaused = self.isWarmPaused(for: id)
                     self.warmAutoPauseUntil[id] = now.addingTimeInterval(Self.warmAutoPauseCooldown)
                     // Record/log only the idle→paused edge, not every re-arm, so a long busy
-                    // stretch is one event rather than one every 5s.
+                    // stretch is one event rather than one every 5s. The readers seen on that
+                    // edge go with it: telemetry gets the bounded labels, the local debug log
+                    // the full process names.
                     if !wasPaused {
                         TelemetryService.shared.recordWarmPause(
-                            profileId: id, profileName: name, paused: true, source: "auto")
-                        SyncTraySettings.debugLog("'\(name)': offline warm auto-paused — an app is reading the mount")
+                            profileId: id, profileName: name, paused: true, source: "auto", readers: readers)
+                        SyncTraySettings.debugLog(
+                            "'\(name)': offline warm auto-paused — reading the mount: \(readers.joined(separator: ", "))")
                     }
                 }
             }
@@ -4373,6 +4880,12 @@ final class SyncManager: ObservableObject {
     /// there are no mount profiles.
     private func reconcileMountStatesOffMain() {
         let mountProfiles = profileStore.enabledProfiles.filter { $0.isMountMode }
+        // A profile that is no longer an enabled, unpaused Stream profile (disabled, deleted,
+        // switched to a sync mode, paused) can't recover from an open drop or stall: close it
+        // as `unmounted`. Runs before the early return so the last Stream profile going away
+        // is covered too.
+        closeMountInterruptions(
+            keeping: Set(mountProfiles.filter { !pausedProfiles.contains($0.id) }.map(\.id)))
         guard !mountProfiles.isEmpty else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
@@ -4402,6 +4915,20 @@ final class SyncManager: ObservableObject {
                     }
 
                     let newMode = isMounted ? modes[profile.id] : nil
+                    // Stall and drop telemetry, skipped while paused: a paused profile can't
+                    // drop, and the close at the top of this pass already ended its
+                    // interruptions, so probing it would only recreate a probe on every tick
+                    // (and leak a blocked thread each time on a stale mount pause left behind).
+                    // Runs before the mode bookkeeping below so a drop is still reported with
+                    // the mode the mount was in.
+                    if !self.pausedProfiles.contains(profile.id) {
+                        self.trackMountInterruption(
+                            for: profile,
+                            wasMounted: before.contains(profile.id),
+                            isMounted: isMounted,
+                            mode: newMode ?? self.profileMountModes[profile.id]
+                        )
+                    }
                     if newMode != self.profileMountModes[profile.id] {
                         self.notifiedBackOnNetworkEpisodes.remove(profile.id)
                         if let newMode {
@@ -4476,6 +5003,202 @@ final class SyncManager: ObservableObject {
                 // that is currently warming, pause the warm (re-armed each tick; see
                 // `refreshWarmAutoPause`). Only touches profiles with a live warm.
                 self.refreshWarmAutoPause(for: mountProfiles)
+            }
+        }
+    }
+
+    // MARK: - Mount interruption telemetry
+
+    /// Telemetry label for a mount mode: the token with underscores, or `unknown`.
+    private static func mountModeLabel(_ mode: MountMode?) -> String {
+        mode.map { $0.rawValue.replacingOccurrences(of: "-", with: "_") } ?? "unknown"
+    }
+
+    /// One mount-monitor tick of stall and drop tracking for an enabled Stream profile
+    /// (CLAUDE.md "Mount interruption telemetry"). While the volume is mounted: close an
+    /// open drop, report a probe that has crossed the stall threshold, and start the next
+    /// responsiveness probe when one is due. On the mounted → gone edge: close an open stall
+    /// and schedule the drop classification, which reports that stall as `dropped` (an
+    /// unexpected drop) or `unmounted` (a deliberate unmount).
+    private func trackMountInterruption(
+        for profile: SyncProfile, wasMounted: Bool, isMounted: Bool, mode: MountMode?
+    ) {
+        let now = Date()
+        let id = profile.id
+        let backend = profile.mountBackend.rawValue
+        let modeLabel = Self.mountModeLabel(mode)
+
+        if isMounted {
+            if let since = mountDropStartedAt.removeValue(forKey: id) {
+                TelemetryService.shared.recordMountInterruptionEnded(
+                    profileId: id, profileName: profile.name, kind: "drop", outcome: "recovered",
+                    durationSeconds: max(0, now.timeIntervalSince(since)), backend: backend, mode: modeLabel)
+            }
+            var probe = mountStallProbes[id] ?? MountStallProbe()
+            if case .stallStarted = probe.evaluate(now: now) {
+                TelemetryService.shared.recordMountInterruptionStarted(
+                    profileId: id, profileName: profile.name, kind: "stall", backend: backend, mode: modeLabel)
+                SyncTraySettings.debugLog(
+                    "'\(profile.name)': mount root has not answered for \(Int(MountStallProbe.stallThreshold))s (stall)")
+            }
+            if probe.shouldStartProbe(now: now) {
+                probe.probeStarted(at: now)
+                startMountResponsivenessProbe(for: profile)
+            }
+            // A stall held because its probe returned with the volume gone, where the volume
+            // was back before any tick saw it missing: no drop check will claim it.
+            if !pendingMountDropChecks.contains(id),
+               let heldStall = pendingStallEndDurations.removeValue(forKey: id) {
+                TelemetryService.shared.recordMountInterruptionEnded(
+                    profileId: id, profileName: profile.name, kind: "stall", outcome: "recovered",
+                    durationSeconds: heldStall, backend: backend, mode: modeLabel)
+            }
+            mountStallProbes[id] = probe
+        } else if wasMounted {
+            if var probe = mountStallProbes[id] {
+                if case let .stallEnded(duration) = probe.volumeWentAway(at: now) {
+                    // Its outcome depends on whether this disappearance was a drop or a
+                    // deliberate unmount, which `scheduleMountDropCheck` decides.
+                    pendingStallEndDurations[id] = duration
+                }
+                mountStallProbes[id] = probe
+            }
+            scheduleMountDropCheck(for: profile, disappearedAt: now, modeLabel: modeLabel)
+        }
+    }
+
+    /// Run one `statfs(2)` on the mount root off the main actor and report back when it
+    /// returns. On a hung hard NFS mount the call blocks until rclone answers (or the volume
+    /// goes away), which is exactly what `MountStallProbe` measures.
+    private func startMountResponsivenessProbe(for profile: SyncProfile) {
+        let token = UUID()
+        mountProbeTokens[profile.id] = token
+        mountProbeQueue.async { [weak self] in
+            let startedAt = Date()
+            _ = Self.mountRootAnswers(profile.localSyncPath)
+            let finishedAt = Date()
+            // A forced detach (the dialog's Disconnect, `diskutil unmount force`) releases a
+            // blocked statfs at once. So a call that returned only after the stall threshold
+            // is checked against the mount table before it counts as rclone answering again.
+            var volumeGone = false
+            if finishedAt.timeIntervalSince(startedAt) >= MountStallProbe.stallThreshold, let self {
+                volumeGone = !self.setupService.isMounted(profile: profile)
+            }
+            DispatchQueue.main.async {
+                self?.finishMountResponsivenessProbe(
+                    profileId: profile.id, token: token, finishedAt: finishedAt, volumeGone: volumeGone)
+            }
+        }
+    }
+
+    /// `statfs(2)` on the mount root (what `attributesOfFileSystem` calls): an FSSTAT round
+    /// trip to rclone's NFS server, a statfs call on macFUSE. Success or error both mean the
+    /// filesystem answered; only a call that doesn't return is a stall.
+    nonisolated private static func mountRootAnswers(_ mountPoint: String) -> Bool {
+        (try? FileManager.default.attributesOfFileSystem(forPath: mountPoint)) != nil
+    }
+
+    private func finishMountResponsivenessProbe(
+        profileId: UUID, token: UUID, finishedAt: Date, volumeGone: Bool
+    ) {
+        // A superseded probe (its state closed while the call was blocked) reports nothing.
+        guard mountProbeTokens[profileId] == token else { return }
+        mountProbeTokens.removeValue(forKey: profileId)
+        guard var probe = mountStallProbes[profileId] else { return }
+        let event = probe.probeFinished(at: finishedAt)
+        mountStallProbes[profileId] = probe
+        guard case let .stallEnded(duration) = event else { return }
+        if volumeGone {
+            // The call returned because the volume was detached, not because rclone answered.
+            // The drop classification decides `dropped` or `unmounted`, as for a stall the
+            // monitor saw vanish (`trackMountInterruption`).
+            pendingStallEndDurations[profileId] = duration
+            return
+        }
+        guard let profile = profileStore.profile(for: profileId) else { return }
+        TelemetryService.shared.recordMountInterruptionEnded(
+            profileId: profileId, profileName: profile.name, kind: "stall", outcome: "recovered",
+            durationSeconds: duration, backend: profile.mountBackend.rawValue,
+            mode: Self.mountModeLabel(profileMountModes[profileId]))
+    }
+
+    /// Classify a mount-table disappearance `MountDropClassifier.confirmDelay` after it was
+    /// seen, once the agent state and the deliberate-unmount marker can be trusted. An
+    /// unexpected drop is reported with its start at the disappearance; if the volume is
+    /// already back by then it is closed straight away as `recovered`.
+    private func scheduleMountDropCheck(for profile: SyncProfile, disappearedAt: Date, modeLabel: String) {
+        let id = profile.id
+        guard mountDropStartedAt[id] == nil, !pendingMountDropChecks.contains(id) else { return }
+        pendingMountDropChecks.insert(id)
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + MountDropClassifier.confirmDelay
+        ) { [weak self] in
+            guard let self else { return }
+            let agentLoaded = self.setupService.isLoaded(profile: profile)
+            let marker = self.setupService.lastDeliberateUnmount(for: profile)
+            DispatchQueue.main.async {
+                self.pendingMountDropChecks.remove(id)
+                let current = self.profileStore.profile(for: id)
+                let unexpected = MountDropClassifier.isUnexpectedDrop(
+                    agentLoaded: agentLoaded,
+                    isEnabledMountProfile: current?.isEnabled == true && current?.isMountMode == true,
+                    isPaused: self.pausedProfiles.contains(id),
+                    lastDeliberateUnmount: marker,
+                    disappearedAt: disappearedAt
+                )
+                if let stallDuration = self.pendingStallEndDurations.removeValue(forKey: id) {
+                    TelemetryService.shared.recordMountInterruptionEnded(
+                        profileId: id, profileName: current?.name ?? profile.name, kind: "stall",
+                        outcome: unexpected ? "dropped" : "unmounted", durationSeconds: stallDuration,
+                        backend: (current ?? profile).mountBackend.rawValue, mode: modeLabel)
+                }
+                guard unexpected, let current else { return }
+                let backend = current.mountBackend.rawValue
+                TelemetryService.shared.recordMountInterruptionStarted(
+                    profileId: id, profileName: current.name, kind: "drop", backend: backend, mode: modeLabel)
+                SyncTraySettings.debugLog("'\(current.name)': volume left the mount table without an unmount (drop)")
+                if self.profileMountStates[id] == .mounted {
+                    TelemetryService.shared.recordMountInterruptionEnded(
+                        profileId: id, profileName: current.name, kind: "drop", outcome: "recovered",
+                        durationSeconds: max(0, Date().timeIntervalSince(disappearedAt)), backend: backend,
+                        mode: Self.mountModeLabel(self.profileMountModes[id]))
+                } else {
+                    self.mountDropStartedAt[id] = disappearedAt
+                }
+            }
+        }
+    }
+
+    /// Close any open drop or stall for a profile that is being unmounted on purpose, or for
+    /// every profile not in `keeping` (no longer an enabled Stream profile). Outcome
+    /// `unmounted`: the interruption ended without the mount coming back.
+    private func closeMountInterruptions(keeping: Set<UUID>? = nil, only: UUID? = nil) {
+        let now = Date()
+        let candidates = Set(mountDropStartedAt.keys).union(mountStallProbes.keys)
+            .union(pendingStallEndDurations.keys)
+        for id in candidates {
+            if let only, id != only { continue }
+            if let keeping, keeping.contains(id) { continue }
+            let profile = profileStore.profile(for: id)
+            let name = profile?.name ?? ""
+            let backend = profile?.mountBackend.rawValue ?? "unknown"
+            let mode = Self.mountModeLabel(profileMountModes[id])
+            if let since = mountDropStartedAt.removeValue(forKey: id) {
+                TelemetryService.shared.recordMountInterruptionEnded(
+                    profileId: id, profileName: name, kind: "drop", outcome: "unmounted",
+                    durationSeconds: max(0, now.timeIntervalSince(since)), backend: backend, mode: mode)
+            }
+            if let duration = pendingStallEndDurations.removeValue(forKey: id) {
+                TelemetryService.shared.recordMountInterruptionEnded(
+                    profileId: id, profileName: name, kind: "stall", outcome: "unmounted",
+                    durationSeconds: duration, backend: backend, mode: mode)
+            }
+            mountProbeTokens.removeValue(forKey: id)
+            if var probe = mountStallProbes.removeValue(forKey: id),
+               case let .stallEnded(duration) = probe.volumeWentAway(at: now) {
+                TelemetryService.shared.recordMountInterruptionEnded(
+                    profileId: id, profileName: name, kind: "stall", outcome: "unmounted",
+                    durationSeconds: duration, backend: backend, mode: mode)
             }
         }
     }
@@ -4832,8 +5555,16 @@ final class SyncManager: ObservableObject {
     /// unmounting under an open app), a missed pause only means the warm keeps running, which
     /// is the safe default — the user can always pause manually. Covered by AC-WV2.
     nonisolated static func shouldAutoPauseWarm(lsofOutput: String?) -> Bool {
-        guard let lsofOutput else { return false }
-        return !warmInteractiveReaders(lsofOutput: lsofOutput).isEmpty
+        !warmPauseReaders(lsofOutput: lsofOutput).isEmpty
+    }
+
+    /// The interactive readers behind an auto-pause decision: `warmInteractiveReaders`, or `[]`
+    /// when lsof failed (a failed check never pauses, see `shouldAutoPauseWarm`). This is what
+    /// `refreshWarmAutoPause` reports with the pause, so the telemetry says WHICH process took
+    /// the link (bounded by `TelemetryService.warmPauseReaderSummary`). Covered by AC-WV3.
+    nonisolated static func warmPauseReaders(lsofOutput: String?) -> [String] {
+        guard let lsofOutput else { return [] }
+        return warmInteractiveReaders(lsofOutput: lsofOutput)
     }
 
     /// For each mounted profile in an AUTOMATIC Cache Only mode, probe the primary (reusing
@@ -4978,12 +5709,170 @@ final class SyncManager: ObservableObject {
                     pausedProfiles: paused,
                     errorProfiles: errors
                 )
+                self.recordProfileHeartbeatTelemetry()
                 self.probeMountReadHealth()
                 self.refreshCacheOnlyExcludeLists()
             }
         }
         heartbeatTimer = timer
         timer.resume()
+    }
+
+    /// Per-profile heartbeat telemetry, next to the aggregate `Session heartbeat`: one
+    /// `Sync progress` log per live Two-Way / One-Way run, and one `Profile status` log per
+    /// enabled profile. State is captured here on the main actor; the lock files, rclone.conf
+    /// and the process table are read on a background queue (`profileHeartbeatReports`), and
+    /// the logs are emitted back on main (`recordSyncProgress` reads the open span's context,
+    /// which is main-thread state). Telemetry-gated, so an opted-out user gets no extra file
+    /// reads or `ps` spawns.
+    private func recordProfileHeartbeatTelemetry() {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        let snapshots = profileStore.profiles.map { profile in
+            ProfileHeartbeatSnapshot(
+                profile: profile,
+                state: profileStates[profile.id] ?? .idle,
+                isPaused: pausedProfiles.contains(profile.id),
+                registryActive: exclusiveRunRegistry.isActive(profile.id),
+                storedError: profileErrors[profile.id],
+                progress: profileProgress[profile.id],
+                runStartedAt: syncStartTimes[profile.id]
+            )
+        }
+        guard !snapshots.isEmpty else { return }
+        let appPID = getpid()
+        let homeDirectory = NSHomeDirectory()
+        DispatchQueue.global(qos: .utility).async {
+            let reports = SyncManager.profileHeartbeatReports(
+                snapshots, appPID: appPID, homeDirectory: homeDirectory)
+            DispatchQueue.main.async {
+                let now = Date()
+                for snapshot in reports.progress {
+                    TelemetryService.shared.recordSyncProgress(
+                        profileId: snapshot.profile.id,
+                        profileName: snapshot.profile.name,
+                        syncMode: snapshot.profile.syncMode,
+                        progress: snapshot.progress,
+                        runAgeSeconds: snapshot.runStartedAt.map { now.timeIntervalSince($0) }
+                    )
+                }
+                for status in reports.statuses {
+                    TelemetryService.shared.recordProfileStatus(status)
+                }
+            }
+        }
+    }
+
+    /// Build the heartbeat's per-profile reports from main-actor snapshots. Blocking — it
+    /// reads lock files and rclone.conf and may run `ps` — so call it off the main actor.
+    ///
+    /// - `Sync progress`: every non-mount profile whose run is live by the same rule as
+    ///   `isRunLive` (`runLiveness`: registry token, or a live `/tmp` / session lock holder),
+    ///   or whose state is `.syncing`. Enabled or not — a run outlives a disable.
+    /// - `Profile status`: every enabled profile. The lock states come from
+    ///   `SyncRunLock.lockState`, identifying a live holder with `SyncAbort.isProfileProcess`.
+    ///   A Stream profile reports `n/a` for both (its `/tmp` lock is the mount daemon's for
+    ///   the mount's whole life, R7), and a One-Way profile `n/a` for the session lock
+    ///   (only bisync has one).
+    /// `ps` runs only when a lock holder is a live PID other than the app's: once for the
+    /// table, then once per such PID for its command line.
+    nonisolated static func profileHeartbeatReports(
+        _ snapshots: [ProfileHeartbeatSnapshot], appPID: Int32, homeDirectory: String
+    ) -> ProfileHeartbeatReports {
+        let isAlive: (Int32) -> Bool = SyncRunLock.processIsAlive
+        func readHolder(_ path: String) -> SyncRunLock.Holder {
+            SyncRunLock.parseHolder(try? String(contentsOfFile: path, encoding: .utf8))
+        }
+
+        // Both lock holders of every non-mount profile, read once.
+        var holders: [UUID: (run: SyncRunLock.Holder, session: SyncRunLock.Holder)] = [:]
+        for snapshot in snapshots where !snapshot.profile.isMountMode {
+            holders[snapshot.profile.id] = (
+                run: readHolder(snapshot.profile.lockFilePath),
+                session: readHolder(SyncRunLock.sessionLockPath(for: snapshot.profile))
+            )
+        }
+
+        // The live holder PIDs worth identifying: not the app's own launch-gap placeholder.
+        var livePIDs = Set<Int32>()
+        for held in holders.values {
+            for holder in [held.run, held.session] {
+                if case .pid(let pid) = holder, pid > 0, pid != appPID, isAlive(pid) {
+                    livePIDs.insert(pid)
+                }
+            }
+        }
+        var entriesByPID: [Int32: SyncAbort.ProcessEntry] = [:]
+        var argumentsByPID: [Int32: String] = [:]
+        if !livePIDs.isEmpty {
+            for entry in SyncAbort.readProcessTable() where livePIDs.contains(entry.pid) {
+                entriesByPID[entry.pid] = entry
+            }
+            for pid in entriesByPID.keys {
+                if let arguments = SyncAbort.readArguments(of: pid) {
+                    argumentsByPID[pid] = arguments
+                }
+            }
+        }
+        let entries = entriesByPID
+        let arguments = argumentsByPID
+
+        let rcloneConfig = snapshots.contains(where: { $0.profile.isEnabled })
+            ? RcloneConfigService.shared.readConfigContents() : nil
+
+        var reports = ProfileHeartbeatReports()
+        for snapshot in snapshots {
+            let profile = snapshot.profile
+            let held = holders[profile.id]
+            let runLive = SyncManager.runLiveness(
+                isMount: profile.isMountMode,
+                registryActive: snapshot.registryActive,
+                runLock: held?.run ?? SyncRunLock.Holder.none,
+                sessionLock: held?.session ?? SyncRunLock.Holder.none,
+                isAlive: isAlive
+            )
+            if !profile.isMountMode && (runLive || snapshot.state == .syncing) {
+                reports.progress.append(snapshot)
+            }
+            guard profile.isEnabled else { continue }
+
+            let identify: (Int32) -> Bool = { pid in
+                guard let entry = entries[pid] else { return false }
+                return SyncAbort.isProfileProcess(
+                    entry, arguments: arguments[pid],
+                    configPath: profile.configPath, localSyncPath: profile.localSyncPath)
+            }
+            var lockState = "n/a"
+            var sessionLockState = "n/a"
+            if let held {
+                lockState = SyncRunLock.lockState(
+                    holder: held.run, appPID: appPID, isAlive: isAlive, identify: identify)
+                if profile.syncMode == .bisync {
+                    sessionLockState = SyncRunLock.lockState(
+                        holder: held.session, appPID: appPID, isAlive: isAlive, identify: identify)
+                }
+            }
+            // The stored error when there is one, else the state's own message: "Script not
+            // found" / "Config not found" set `.error` without ever storing a profile error.
+            var errorType: String?
+            if case .error(let stateMessage) = snapshot.state {
+                errorType = TelemetryService.categorizeError(snapshot.storedError ?? stateMessage)
+            }
+            let remoteTypes = RemoteBackendType.types(for: profile, rcloneConfig: rcloneConfig)
+            reports.statuses.append(ProfileStatusReport(
+                profileId: profile.id,
+                profileName: profile.name,
+                syncMode: profile.syncMode,
+                state: TelemetryService.profileStateLabel(snapshot.state, isPaused: snapshot.isPaused),
+                runLive: runLive,
+                lockState: lockState,
+                sessionLockState: sessionLockState,
+                errorType: errorType,
+                localPathKind: SyncPathKind.classify(localPath: profile.localSyncPath, homeDirectory: homeDirectory),
+                remoteType: remoteTypes.primary,
+                fallbackRemoteType: remoteTypes.fallback
+            ))
+        }
+        return reports
     }
 
     /// How often a streaming profile's Cache Only partial-file list is rebuilt.

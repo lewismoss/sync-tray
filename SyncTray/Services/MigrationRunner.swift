@@ -46,6 +46,10 @@ enum MigrationRunner {
         MigrationV2FixVFSCachePath(),
         MigrationV3BlobToPerProfileFiles(),
         MigrationV4Retired(),
+        MigrationV5PhotosLibraryExclude(),
+        MigrationV6VolumeSystemFoldersExclude(),
+        MigrationV7VolumeSystemFolderResyncFromListings(),
+        MigrationV8PhotoBoothLibraryExclude(),
     ]
 
     /// Run all pending migrations. Call this once at app startup,
@@ -318,7 +322,9 @@ struct MigrationV3BlobToPerProfileFiles: ProfileMigration {
     /// got a file) is OBSERVABLE rather than losing config quietly.
     @discardableResult
     static func writeProfileFiles(from profileDicts: [[String: Any]], to directory: String) throws -> WriteResult {
-        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            atPath: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
 
         var written = 0
         var present = 0
@@ -371,4 +377,487 @@ struct MigrationV4Retired: ProfileMigration {
     let description = "Retired cache-pinning migration — intentionally a no-op"
 
     func migrateUserDefaults(_ defaults: UserDefaults) throws {}
+}
+
+// MARK: - Shared default-exclude migration body (v5 Photos, v8 Photo Booth, …)
+
+/// Shared body for a "add a default TCC-blocked-library exclude rule to every existing
+/// Two-Way/One-Way filter" migration. `MigrationV5PhotosLibraryExclude` and
+/// `MigrationV8PhotoBoothLibraryExclude` are both thin wrappers over `apply(_:in:hasEntry:logTag:)`
+/// and `containsEntry(under:matching:)`, so the two migrations can't drift apart.
+///
+/// Per profile (read from its raw `{shortId}.profile.json`, before `ProfileStore` loads):
+/// - Stream (mount) profiles have no sync filter and are skipped.
+/// - A missing filter file is left missing — the next install writes it from the defaults,
+///   which already carry the rule.
+/// - A filter that already mentions `def.mentionToken` (the default, or the user's own rule) or
+///   isn't readable UTF-8 is left exactly as it is.
+/// - On a Two-Way profile whose local folder actually holds a matching entry, the
+///   resync-pending marker is written right after the filter (the same filter-then-marker,
+///   roll-back-on-failure order `SyncSetupService.writeExcludeFilter` uses). A library the
+///   profile used to sync would otherwise vanish from bisync's listings at once, which counts
+///   as deletions against `--max-delete` and, for a library holding over half the profile's
+///   files, would stop every run at the safety abort. Profiles without a matching entry get no
+///   marker: the rule matches nothing there, so there is nothing to resync.
+///
+/// Per-profile failures are logged and skipped, never thrown: one unwritable filter must not
+/// hold back the schema version (and every later migration) forever.
+enum DefaultExcludeMigration {
+    /// Short ids of the profiles each step touched, so `ConfigSelfTest` can assert exactly
+    /// what changed.
+    struct Outcome: Equatable {
+        var updated: [String] = []
+        var resyncScheduled: [String] = []
+        var failed: [String] = []
+    }
+
+    /// Apply `def` to every `*.profile.json` in `directory`. Idempotent: a second pass finds the
+    /// rule already present (via `def.mentionToken`) and changes nothing.
+    /// - Parameter hasEntry: whether a local sync folder holds a matching library; injectable so
+    ///   `ConfigSelfTest` doesn't depend on the machine's real folders.
+    /// - Parameter logTag: bracketed log prefix, e.g. `[MigrationV5]`.
+    @discardableResult
+    static func apply(
+        _ def: SyncExcludeFilter.DefaultExclude,
+        in directory: String,
+        hasEntry: (String) -> Bool,
+        logTag: String
+    ) -> Outcome {
+        var outcome = Outcome()
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: directory) else { return outcome }
+
+        for file in files.sorted() where file.hasSuffix(".profile.json") {
+            let profilePath = (directory as NSString).appendingPathComponent(file)
+            guard let data = fm.contents(atPath: profilePath),
+                  let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let idString = dict["id"] as? String, !idString.isEmpty else { continue }
+
+            // Same derivation as `SyncProfile.shortId`; a missing `syncMode` decodes as bisync.
+            let shortId = String(idString.prefix(8)).lowercased()
+            let syncMode = (dict["syncMode"] as? String) ?? SyncMode.bisync.rawValue
+            guard syncMode != SyncMode.mount.rawValue else { continue }
+
+            let filterPath = (directory as NSString).appendingPathComponent("\(shortId)-exclude.txt")
+            guard fm.fileExists(atPath: filterPath),
+                  let existing = try? String(contentsOfFile: filterPath, encoding: .utf8),
+                  let updated = SyncExcludeFilter.addingDefault(def, to: existing) else { continue }
+
+            do {
+                try updated.write(toFile: filterPath, atomically: true, encoding: .utf8)
+            } catch {
+                SyncTraySettings.debugLog("\(logTag) could not update \(filterPath): \(error.localizedDescription)")
+                outcome.failed.append(shortId)
+                continue
+            }
+
+            let localPath = (dict["localSyncPath"] as? String) ?? ""
+            if syncMode == SyncMode.bisync.rawValue, !localPath.isEmpty,
+               hasEntry((localPath as NSString).expandingTildeInPath) {
+                let markerPath = (directory as NSString).appendingPathComponent("\(shortId).resync-pending")
+                do {
+                    try UUID().uuidString.write(toFile: markerPath, atomically: true, encoding: .utf8)
+                    outcome.resyncScheduled.append(shortId)
+                } catch {
+                    // Roll the filter back so the next launch can't skip this profile with the
+                    // rule in place but no resync scheduled (the schema version still advances,
+                    // so the profile simply keeps its old filter).
+                    try? existing.write(toFile: filterPath, atomically: true, encoding: .utf8)
+                    SyncTraySettings.debugLog("\(logTag) could not schedule a resync for \(shortId): \(error.localizedDescription)")
+                    outcome.failed.append(shortId)
+                    continue
+                }
+            }
+            outcome.updated.append(shortId)
+        }
+        return outcome
+    }
+
+    /// Whether `root` holds an entry matching `def.matchesEntry` within `maxDepth` folder
+    /// levels. The match check runs BEFORE the package-content skip, since both a
+    /// `.photoslibrary` and `Photo Booth Library` are themselves packages. Hidden entries are
+    /// skipped, symlinks aren't followed, and the walk stops after `maxEntries` entries so a huge
+    /// tree can't stall launch; anything unreadable (including a folder macOS won't let the app
+    /// list) counts as "not found".
+    static func containsEntry(
+        under root: String, matching def: SyncExcludeFilter.DefaultExclude, maxDepth: Int = 3, maxEntries: Int = 20_000
+    ) -> Bool {
+        let fm = FileManager.default
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .isPackageKey]
+        var queue: [(url: URL, depth: Int)] = [(URL(fileURLWithPath: root, isDirectory: true), 0)]
+        var seen = 0
+        while !queue.isEmpty {
+            let (directory, depth) = queue.removeFirst()
+            guard let entries = try? fm.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) else { continue }
+            for entry in entries {
+                seen += 1
+                if seen > maxEntries { return false }
+                if def.matchesEntry(entry) { return true }
+                guard depth + 1 < maxDepth,
+                      let values = try? entry.resourceValues(forKeys: Set(keys)),
+                      values.isDirectory == true, values.isSymbolicLink != true,
+                      values.isPackage != true else { continue }
+                queue.append((entry, depth + 1))
+            }
+        }
+        return false
+    }
+}
+
+// MARK: - Migration V5: exclude Apple Photos libraries from existing profiles
+
+/// Adds the Photos-library default rule (`SyncExcludeFilter.photosLibraryRule`) to the exclude
+/// filter of every existing Two-Way and One-Way profile. New filter files get it from
+/// `SyncSetupService.defaultExcludeFilter`; this covers files written before it was a default,
+/// which are otherwise only re-created from the defaults when a profile is disabled and
+/// re-enabled. See `DefaultExcludeMigration` for the shared body this wraps.
+struct MigrationV5PhotosLibraryExclude: ProfileMigration {
+    let version = 5
+    let description = "Exclude Apple Photos libraries (*.photoslibrary) from existing Two-Way and One-Way profiles"
+
+    /// Overridable for self-test isolation; defaults to the real profiles directory.
+    var profilesDirectoryOverride: String?
+
+    private var profilesDirectory: String { profilesDirectoryOverride ?? SyncProfile.configDirectory }
+
+    func migrateUserDefaults(_ defaults: UserDefaults) throws {
+        let outcome = Self.addPhotosLibraryExclude(in: profilesDirectory)
+        print("[SyncTray] Migration v5: added the Photos-library exclude to \(outcome.updated.count) profile(s), "
+            + "scheduled \(outcome.resyncScheduled.count) resync(s), \(outcome.failed.count) failure(s)")
+    }
+
+    /// Back-compat alias — see `DefaultExcludeMigration.Outcome`.
+    typealias Outcome = DefaultExcludeMigration.Outcome
+
+    /// Apply the migration to every `*.profile.json` in `directory`. Idempotent: a second pass
+    /// finds the rule already present and changes nothing.
+    /// - Parameter hasPhotosLibrary: whether a local sync folder holds a `.photoslibrary`;
+    ///   injectable so `ConfigSelfTest` doesn't depend on the machine's real folders.
+    @discardableResult
+    static func addPhotosLibraryExclude(
+        in directory: String,
+        hasPhotosLibrary: (String) -> Bool = { containsPhotosLibrary(under: $0) }
+    ) -> Outcome {
+        DefaultExcludeMigration.apply(.photosLibrary, in: directory, hasEntry: hasPhotosLibrary, logTag: "[MigrationV5]")
+    }
+
+    /// Back-compat wrapper — see `DefaultExcludeMigration.containsEntry(under:matching:)`.
+    static func containsPhotosLibrary(under root: String, maxDepth: Int = 3, maxEntries: Int = 20_000) -> Bool {
+        DefaultExcludeMigration.containsEntry(under: root, matching: .photosLibrary, maxDepth: maxDepth, maxEntries: maxEntries)
+    }
+}
+
+// MARK: - Migration V6: exclude macOS volume system folders from existing profiles
+
+/// Adds the volume-system-folder defaults (`SyncExcludeFilter.volumeSystemFoldersSection`:
+/// `.fseventsd`, `.Spotlight-V100`, `.Trashes`, `.DocumentRevisions-V100`, `.TemporaryItems`,
+/// each as a `/**` directory rule) to the exclude filter of every existing Two-Way and One-Way
+/// profile. New filter files get them from `SyncSetupService.defaultExcludeFilter`.
+///
+/// Why: these root-owned folders sit at the root of every volume macOS mounts. A profile whose
+/// local folder is a volume root, with no "Sync Only These Folders" entries, had nothing
+/// keeping rclone out of them — the old default `- .fseventsd` is a file-only rule — so every
+/// run failed with "permission denied" and rclone stopped propagating deletions.
+///
+/// Same per-profile rules as v5 (raw `{shortId}.profile.json`, before `ProfileStore` loads):
+/// Stream profiles and missing or unreadable filters are skipped, a filter that already has
+/// every rule is left as it is, and failures are logged, never thrown. A Two-Way profile gets
+/// the resync-pending marker (filter first, rolled back if the marker fails) only when bisync's
+/// own listings hold one of the folders (`VolumeSystemFolderListings`): only then does excluding
+/// it now count as deletions. The listings live in `~/Library/Caches`, so the answer doesn't
+/// depend on whether the profile's drive is plugged in at upgrade.
+struct MigrationV6VolumeSystemFoldersExclude: ProfileMigration {
+    let version = 6
+    let description = "Exclude macOS volume system folders (.Spotlight-V100, .Trashes, …) from existing Two-Way and One-Way profiles"
+
+    /// Overridable for self-test isolation; defaults to the real profiles directory.
+    var profilesDirectoryOverride: String?
+
+    private var profilesDirectory: String { profilesDirectoryOverride ?? SyncProfile.configDirectory }
+
+    func migrateUserDefaults(_ defaults: UserDefaults) throws {
+        let outcome = Self.addVolumeSystemFoldersExclude(in: profilesDirectory)
+        print("[SyncTray] Migration v6: added the volume-system-folder excludes to \(outcome.updated.count) profile(s), "
+            + "scheduled \(outcome.resyncScheduled.count) resync(s), \(outcome.failed.count) failure(s)")
+    }
+
+    /// Short ids of the profiles each step touched, so `ConfigSelfTest` can assert exactly
+    /// what changed.
+    struct Outcome: Equatable {
+        var updated: [String] = []
+        var resyncScheduled: [String] = []
+        var failed: [String] = []
+    }
+
+    /// Apply the migration to every `*.profile.json` in `directory`. Idempotent.
+    /// - Parameter listsSystemFolder: whether bisync's listings for a raw profile hold a volume
+    ///   system folder; injectable so `ConfigSelfTest` doesn't depend on the machine's real
+    ///   bisync cache.
+    @discardableResult
+    static func addVolumeSystemFoldersExclude(
+        in directory: String,
+        listsSystemFolder: ([String: Any], [String: Any]?) -> Bool = {
+            VolumeSystemFolderListings.containSystemFolder(profile: $0, derivedConfig: $1)
+        }
+    ) -> Outcome {
+        var outcome = Outcome()
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: directory) else { return outcome }
+
+        for file in files.sorted() where file.hasSuffix(".profile.json") {
+            let profilePath = (directory as NSString).appendingPathComponent(file)
+            guard let data = fm.contents(atPath: profilePath),
+                  let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let idString = dict["id"] as? String, !idString.isEmpty else { continue }
+
+            // Same derivation as `SyncProfile.shortId`; a missing `syncMode` decodes as bisync.
+            let shortId = String(idString.prefix(8)).lowercased()
+            let syncMode = (dict["syncMode"] as? String) ?? SyncMode.bisync.rawValue
+            guard syncMode != SyncMode.mount.rawValue else { continue }
+
+            let filterPath = (directory as NSString).appendingPathComponent("\(shortId)-exclude.txt")
+            guard fm.fileExists(atPath: filterPath),
+                  let existing = try? String(contentsOfFile: filterPath, encoding: .utf8),
+                  let updated = SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: existing) else { continue }
+
+            do {
+                try updated.write(toFile: filterPath, atomically: true, encoding: .utf8)
+            } catch {
+                SyncTraySettings.debugLog("[MigrationV6] could not update \(filterPath): \(error.localizedDescription)")
+                outcome.failed.append(shortId)
+                continue
+            }
+
+            let localPath = (dict["localSyncPath"] as? String) ?? ""
+            if syncMode == SyncMode.bisync.rawValue, !localPath.isEmpty,
+               listsSystemFolder(dict, VolumeSystemFolderListings.derivedConfig(shortId: shortId, in: directory)) {
+                let markerPath = (directory as NSString).appendingPathComponent("\(shortId).resync-pending")
+                do {
+                    try UUID().uuidString.write(toFile: markerPath, atomically: true, encoding: .utf8)
+                    outcome.resyncScheduled.append(shortId)
+                } catch {
+                    try? existing.write(toFile: filterPath, atomically: true, encoding: .utf8)
+                    SyncTraySettings.debugLog("[MigrationV6] could not schedule a resync for \(shortId): \(error.localizedDescription)")
+                    outcome.failed.append(shortId)
+                    continue
+                }
+            }
+            outcome.updated.append(shortId)
+        }
+        return outcome
+    }
+}
+
+// MARK: - Bisync listings: did a past run sync a volume system folder?
+
+/// Reads rclone bisync's listing files (`<session>.path1.lst` / `.path2.lst` in
+/// `SyncSetupService.bisyncWorkDir`) to tell whether a profile's last successful two-way sync
+/// included one of `SyncExcludeFilter.volumeSystemFolderNames`. That is the exact condition
+/// under which the new excludes need a resync: a listed system folder that the filter now drops
+/// counts as deleted on both sides, and enough of them stop every run at `--max-delete`.
+///
+/// Why the listings and not the folder on disk: the listings sit in `~/Library/Caches`, so they
+/// answer even while the profile's external drive is unplugged, and they never claim a folder
+/// that "Sync Only These Folders" or a hand-written rule kept out of the sync.
+enum VolumeSystemFolderListings {
+    /// Whether the listings of any session the sync script would run for this profile list a
+    /// path with a volume system folder as one of its components (the rules are unanchored, so a
+    /// nested folder counts). Only those exact sessions are read: a leftover session from an old
+    /// fallback, or another folder whose canonical name happens to match, never counts. A missing
+    /// or unreadable cache is "no".
+    static func containSystemFolder(
+        profile: [String: Any], derivedConfig: [String: Any]?, workDir: String = SyncSetupService.bisyncWorkDir
+    ) -> Bool {
+        sessionNames(profile: profile, derivedConfig: derivedConfig).contains { session in
+            ["path1", "path2"].contains { side in
+                let file = (workDir as NSString).appendingPathComponent("\(session).\(side).lst")
+                guard let text = try? String(contentsOfFile: file, encoding: .utf8) else { return false }
+                return text.split(separator: "\n").contains { line in
+                    guard let path = listedPath(in: line) else { return false }
+                    return path.split(separator: "/").contains { SyncExcludeFilter.volumeSystemFolderNames.contains(String($0)) }
+                }
+            }
+        }
+    }
+
+    /// The derived `{shortId}.json` beside the profile file, which is what the sync script
+    /// reads, or nil when it is missing or unreadable.
+    static func derivedConfig(shortId: String, in directory: String) -> [String: Any]? {
+        let path = (directory as NSString).appendingPathComponent("\(shortId).json")
+        guard let data = FileManager.default.contents(atPath: path) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    /// The bisync sessions the sync script's `REQUIRED_SESSIONS` holds: the primary (`remote`),
+    /// plus the fallback's own session when it swaps the whole remote reference — a fallback
+    /// path is set, or `fallbackRequiresCacheRebuild` — named
+    /// `${FALLBACK_REMOTE}:${FALLBACK_PATH:-$REMOTE_PATH}`. The inputs come from the derived
+    /// config, as the script reads them; the stored `fallbackRequiresCacheRebuild` is never
+    /// computed, so without a derived config any fallback counts as a full swap, the same safe
+    /// default `computeFallbackRequiresCacheRebuild` falls back to. Each session is named for
+    /// both the stored and the `~`-expanded local folder.
+    static func sessionNames(profile: [String: Any], derivedConfig: [String: Any]?) -> [String] {
+        func value(_ derivedKey: String, _ profileKey: String) -> String {
+            (derivedConfig?[derivedKey] as? String) ?? (profile[profileKey] as? String) ?? ""
+        }
+        let localPath = value("localPath", "localSyncPath")
+        let remotePath = value("remotePath", "remotePath")
+        let primary: String
+        if let remote = derivedConfig?["remote"] as? String, !remote.isEmpty {
+            primary = remote
+        } else {
+            let rcloneRemote = (profile["rcloneRemote"] as? String) ?? ""
+            guard !rcloneRemote.isEmpty else { return [] }
+            let base = rcloneRemote.hasSuffix(":") ? String(rcloneRemote.dropLast()) : rcloneRemote
+            primary = remotePath.isEmpty ? "\(base):" : "\(base):\(remotePath)"
+        }
+        guard !localPath.isEmpty else { return [] }
+        var remotes = [primary]
+
+        let fallbackRemote = value("fallbackRemote", "fallbackRemote")
+        let fallbackPath = value("fallbackRemotePath", "fallbackRemotePath")
+        let rebuild = derivedConfig.map { ($0["fallbackRequiresCacheRebuild"] as? Bool) ?? false } ?? true
+        if !fallbackRemote.isEmpty, !fallbackPath.isEmpty || rebuild {
+            remotes.append("\(fallbackRemote):\(fallbackPath.isEmpty ? remotePath : fallbackPath)")
+        }
+        let locals = [localPath, (localPath as NSString).expandingTildeInPath]
+        var names: [String] = []
+        for remote in remotes {
+            for local in locals {
+                let name = SyncSetupService.bisyncSessionName(remote: remote, localPath: local)
+                if !names.contains(name) { names.append(name) }
+            }
+        }
+        return names
+    }
+
+    /// The quoted path at the end of a listing line
+    /// (`- 36 - - 2026-10-18T01:12:35.000000000+0000 ".fseventsd/fseventsd-uuid"`), or nil for
+    /// the `#` header and blank lines.
+    static func listedPath<S: StringProtocol>(in line: S) -> String? {
+        guard !line.hasPrefix("#"), let first = line.firstIndex(of: "\""), let last = line.lastIndex(of: "\""),
+              first < last else { return nil }
+        return String(line[line.index(after: first)..<last])
+    }
+}
+
+// MARK: - Migration V7: schedule the resync v6 decided from the drive instead of the listings
+
+/// The first release of v6 decided the resync from the drive: a readable system folder at the
+/// local root. So a profile whose external drive was unplugged at upgrade got the new excludes
+/// but no resync, though its listings still hold the folders — once they outnumber the user's
+/// own files, every run stops at `--max-delete`. v6 now reads the listings; this re-runs that
+/// decision once for installs that already ran the first v6.
+///
+/// For every Two-Way profile whose filter already carries all the volume-system-folder rules
+/// and that has no resync-pending marker, it writes one when `VolumeSystemFolderListings` finds
+/// a listed system folder. It never edits a filter. A marker already present (from v6, an include
+/// edit or v5) is left alone, and after a run has synced under the new rules the listings no
+/// longer hold the folders, so nothing is scheduled twice.
+struct MigrationV7VolumeSystemFolderResyncFromListings: ProfileMigration {
+    let version = 7
+    let description = "Schedule the resync the volume-system-folder excludes need, from bisync's listings"
+
+    /// Overridable for self-test isolation; defaults to the real profiles directory.
+    var profilesDirectoryOverride: String?
+
+    private var profilesDirectory: String { profilesDirectoryOverride ?? SyncProfile.configDirectory }
+
+    func migrateUserDefaults(_ defaults: UserDefaults) throws {
+        let outcome = Self.scheduleResyncs(in: profilesDirectory)
+        print("[SyncTray] Migration v7: scheduled \(outcome.resyncScheduled.count) volume-system-folder resync(s), "
+            + "\(outcome.failed.count) failure(s)")
+    }
+
+    struct Outcome: Equatable {
+        var resyncScheduled: [String] = []
+        var failed: [String] = []
+    }
+
+    /// Apply the migration to every `*.profile.json` in `directory`. Idempotent.
+    @discardableResult
+    static func scheduleResyncs(
+        in directory: String,
+        listsSystemFolder: ([String: Any], [String: Any]?) -> Bool = {
+            VolumeSystemFolderListings.containSystemFolder(profile: $0, derivedConfig: $1)
+        }
+    ) -> Outcome {
+        var outcome = Outcome()
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: directory) else { return outcome }
+
+        for file in files.sorted() where file.hasSuffix(".profile.json") {
+            let profilePath = (directory as NSString).appendingPathComponent(file)
+            guard let data = fm.contents(atPath: profilePath),
+                  let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let idString = dict["id"] as? String, !idString.isEmpty else { continue }
+
+            // Same derivation as `SyncProfile.shortId`; a missing `syncMode` decodes as bisync.
+            let shortId = String(idString.prefix(8)).lowercased()
+            let syncMode = (dict["syncMode"] as? String) ?? SyncMode.bisync.rawValue
+            let localPath = (dict["localSyncPath"] as? String) ?? ""
+            guard syncMode == SyncMode.bisync.rawValue, !localPath.isEmpty else { continue }
+
+            let filterPath = (directory as NSString).appendingPathComponent("\(shortId)-exclude.txt")
+            let markerPath = (directory as NSString).appendingPathComponent("\(shortId).resync-pending")
+            guard !fm.fileExists(atPath: markerPath),
+                  let filter = try? String(contentsOfFile: filterPath, encoding: .utf8),
+                  SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: filter) == nil,
+                  listsSystemFolder(dict, VolumeSystemFolderListings.derivedConfig(shortId: shortId, in: directory)) else { continue }
+
+            do {
+                try UUID().uuidString.write(toFile: markerPath, atomically: true, encoding: .utf8)
+                outcome.resyncScheduled.append(shortId)
+            } catch {
+                SyncTraySettings.debugLog("[MigrationV7] could not schedule a resync for \(shortId): \(error.localizedDescription)")
+                outcome.failed.append(shortId)
+            }
+        }
+        return outcome
+    }
+}
+
+// MARK: - Migration V8: exclude the Apple Photo Booth library from existing profiles
+
+/// Adds the Photo Booth default rule (`SyncExcludeFilter.DefaultExclude.photoBoothLibrary`) to
+/// the exclude filter of every existing Two-Way and One-Way profile, mirroring
+/// `MigrationV5PhotosLibraryExclude` exactly (see plan decision D3): same filter-then-marker
+/// write order with rollback on marker failure, same Stream/missing-filter/already-mentioned
+/// skips, same per-profile failure handling. See `DefaultExcludeMigration` for the shared body.
+struct MigrationV8PhotoBoothLibraryExclude: ProfileMigration {
+    let version = 8
+    let description = "Exclude the Apple Photo Booth library (Photo Booth Library) from existing Two-Way and One-Way profiles"
+
+    /// Overridable for self-test isolation; defaults to the real profiles directory.
+    var profilesDirectoryOverride: String?
+
+    private var profilesDirectory: String { profilesDirectoryOverride ?? SyncProfile.configDirectory }
+
+    func migrateUserDefaults(_ defaults: UserDefaults) throws {
+        let outcome = Self.addPhotoBoothLibraryExclude(in: profilesDirectory)
+        print("[SyncTray] Migration v8: added the Photo Booth-library exclude to \(outcome.updated.count) profile(s), "
+            + "scheduled \(outcome.resyncScheduled.count) resync(s), \(outcome.failed.count) failure(s)")
+    }
+
+    /// Back-compat alias — see `DefaultExcludeMigration.Outcome`.
+    typealias Outcome = DefaultExcludeMigration.Outcome
+
+    /// Apply the migration to every `*.profile.json` in `directory`. Idempotent: a second pass
+    /// finds the rule already present and changes nothing.
+    /// - Parameter hasPhotoBoothLibrary: whether a local sync folder holds a `Photo Booth
+    ///   Library`; injectable so `ConfigSelfTest` doesn't depend on the machine's real folders.
+    @discardableResult
+    static func addPhotoBoothLibraryExclude(
+        in directory: String,
+        hasPhotoBoothLibrary: (String) -> Bool = { containsPhotoBoothLibrary(under: $0) }
+    ) -> Outcome {
+        DefaultExcludeMigration.apply(.photoBoothLibrary, in: directory, hasEntry: hasPhotoBoothLibrary, logTag: "[MigrationV8]")
+    }
+
+    /// Whether `root` holds a `Photo Booth Library` package within `maxDepth` folder levels —
+    /// see `DefaultExcludeMigration.containsEntry(under:matching:)`.
+    static func containsPhotoBoothLibrary(under root: String, maxDepth: Int = 3, maxEntries: Int = 20_000) -> Bool {
+        DefaultExcludeMigration.containsEntry(under: root, matching: .photoBoothLibrary, maxDepth: maxDepth, maxEntries: maxEntries)
+    }
 }

@@ -233,6 +233,131 @@ enum MountState: Equatable {
     }
 }
 
+// MARK: - Mount interruption tracking
+
+/// Pure state machine behind the mount STALL telemetry (CLAUDE.md "Mount interruption
+/// telemetry", AC-MI1). The mount monitor sends one `statfs(2)` at a time to a mounted
+/// Stream profile's mount root: an NFS FSSTAT round trip to rclone's local NFS server
+/// (or a FUSE statfs on macFUSE). A probe that has not returned after `stallThreshold`
+/// is a stall: filesystem calls on the mount are not being answered, which is the
+/// condition macOS reports as "Server connections interrupted" and Finder shows as a
+/// hang. The volume stays in the mount table throughout, so the mount-table check
+/// (`SyncSetupService.isMounted`) cannot see it.
+///
+/// No I/O here: the monitor supplies the clock and reports when the probe returns, so
+/// every transition is unit-testable.
+struct MountStallProbe: Equatable {
+    /// A probe still outstanding after this long counts as a stall. Long enough that a
+    /// cold FSSTAT over a slow backend doesn't trip it, short enough to catch the hangs
+    /// a user notices.
+    static let stallThreshold: TimeInterval = 15
+    /// Minimum gap between one probe returning and the next starting: one cheap
+    /// round trip every 30 s per mounted profile.
+    static let probeInterval: TimeInterval = 30
+
+    /// When the outstanding probe started, or nil when none is outstanding.
+    private(set) var inFlightSince: Date?
+    /// When the last probe returned.
+    private(set) var lastFinishedAt: Date?
+    /// The outstanding probe's stall has been reported and not yet closed.
+    private(set) var stallOpen = false
+    /// The outstanding probe may no longer report: its stall was closed by the volume
+    /// going away, or it was already outstanding when the volume went away.
+    private(set) var probeSettled = false
+
+    enum Event: Equatable {
+        case none
+        case stallStarted(since: Date)
+        case stallEnded(duration: TimeInterval)
+    }
+
+    /// Whether a new probe should start now: none outstanding (at most one blocked
+    /// thread per profile, however long the mount hangs) and the interval has passed.
+    func shouldStartProbe(now: Date) -> Bool {
+        guard inFlightSince == nil else { return false }
+        guard let last = lastFinishedAt else { return true }
+        return now.timeIntervalSince(last) >= Self.probeInterval
+    }
+
+    mutating func probeStarted(at date: Date) {
+        inFlightSince = date
+        stallOpen = false
+        probeSettled = false
+    }
+
+    /// Evaluate the outstanding probe on a monitor tick. Returns `.stallStarted` exactly
+    /// once per probe, the first time it has been outstanding for `stallThreshold`.
+    mutating func evaluate(now: Date) -> Event {
+        guard let since = inFlightSince, !stallOpen, !probeSettled,
+              now.timeIntervalSince(since) >= Self.stallThreshold else { return .none }
+        stallOpen = true
+        return .stallStarted(since: since)
+    }
+
+    /// The probe returned, with success or an error: either way the filesystem answered.
+    /// Closes an open stall; the duration runs from the probe's start, so it is a lower
+    /// bound on how long the mount was unresponsive.
+    mutating func probeFinished(at date: Date) -> Event {
+        guard let since = inFlightSince else { return .none }
+        let wasOpen = stallOpen
+        inFlightSince = nil
+        stallOpen = false
+        probeSettled = false
+        lastFinishedAt = date
+        return wasOpen ? .stallEnded(duration: max(0, date.timeIntervalSince(since))) : .none
+    }
+
+    /// The volume left the mount table. Closes an open stall (the caller reports it once the
+    /// drop classification has decided between `dropped` and `unmounted`) and settles the
+    /// outstanding probe so it can't report again when its blocked call finally returns.
+    mutating func volumeWentAway(at date: Date) -> Event {
+        guard let since = inFlightSince else { return .none }
+        probeSettled = true
+        guard stallOpen else { return .none }
+        stallOpen = false
+        return .stallEnded(duration: max(0, date.timeIntervalSince(since)))
+    }
+}
+
+/// Decides which mount-table disappearances are DROPS for the mount telemetry
+/// (CLAUDE.md "Mount interruption telemetry", AC-MI2): the volume vanished and nobody
+/// asked for it. Two signals rule out a deliberate unmount:
+/// - **The deliberate-unmount marker.** Every detach SyncTray performs, from the app or
+///   the CLI, goes through `SyncSetupService` (`unmount`, `uninstall` and therefore every
+///   reinstall and Cache Only switch, `unloadAgent` for pause, the orphan cleanup), which
+///   touches `SyncProfile.deliberateUnmountMarkerPath` first. A disappearance within
+///   `deliberateWindow` of that touch is deliberate, even when the agent is loaded again by
+///   the time we look (a reinstall reloads it within seconds).
+/// - **The launchd agent is unloaded** (checked `confirmDelay` after the disappearance,
+///   since `unmount` unloads it only after detaching): someone stopped the profile.
+/// What remains is a volume that vanished under a loaded agent with no marker: rclone
+/// exited, or macOS detached it (for example the "Disconnect" button in the "Server
+/// connections interrupted" dialog).
+enum MountDropClassifier {
+    /// How long after the volume disappears to wait before reading the agent's state.
+    static let confirmDelay: TimeInterval = 10
+    /// How long a deliberate-unmount marker explains a disappearance. Covers a slow
+    /// graceful `diskutil unmount` falling back to a forced one.
+    static let deliberateWindow: TimeInterval = 120
+
+    static func isUnexpectedDrop(
+        agentLoaded: Bool,
+        isEnabledMountProfile: Bool,
+        isPaused: Bool,
+        lastDeliberateUnmount: Date?,
+        disappearedAt: Date
+    ) -> Bool {
+        guard agentLoaded, isEnabledMountProfile, !isPaused else { return false }
+        if let marker = lastDeliberateUnmount {
+            // The marker is written before the detach, so a deliberate disappearance is
+            // seen after it; 1 s of slack absorbs timestamp granularity.
+            let age = disappearedAt.timeIntervalSince(marker)
+            if age >= -1 && age <= deliberateWindow { return false }
+        }
+        return true
+    }
+}
+
 /// The actual mode a Stream (mount) profile's rclone process is running in RIGHT NOW,
 /// read from the per-boot state file (`SyncProfile.mountModePath`) the sync script
 /// writes right before starting rclone. Distinct from `SyncProfile.streamCacheOnly`,
@@ -389,6 +514,22 @@ enum SyncLogPatterns {
         return lower.contains("starting bisync") || lower.contains("starting sync")
     }
 
+    /// The start line `SyncManager.performResync` writes for an auto-fix `--resync`. It still
+    /// matches `isSyncStarted`; `isAutoFixResyncStart` lets the log pipeline tell that run's
+    /// success apart from a normal bisync's (#123).
+    static let autoFixResyncStartLine = "Starting bisync (auto-fix --resync)"
+
+    static func isAutoFixResyncStart(_ line: String) -> Bool {
+        line.contains(autoFixResyncStartLine)
+    }
+
+    /// bisync's final check-sync listing comparison found a file on one side only ("Path1 file
+    /// not found in Path2", "Path2 file not found in Path1"). rclone names the file only in the
+    /// JSON line's `object`.
+    static func isCheckSyncMismatch(_ message: String) -> Bool {
+        message.contains("file not found in Path")
+    }
+
     /// Patterns indicating sync completed successfully
     static func isSyncCompleted(_ message: String) -> Bool {
         let lower = message.lowercased()
@@ -456,6 +597,137 @@ enum SyncLogPatterns {
     /// This is expected after a `--resync` and resolves on the next sync.
     static func isTransientAllFilesChangedError(_ message: String) -> Bool {
         message.contains("all files were changed") || message.contains("Safety abort")
+    }
+
+    /// rclone's NFS server (go-nfs, behind `rclone nfsmount`, the default Stream backend)
+    /// logs "failing create to indicate lack of support for 'exclusive' mode." at ERROR
+    /// level every time the NFS client asks for an NFSv3 EXCLUSIVE create, i.e. whenever
+    /// an app on the Mac opens a new file on the mount with `O_CREAT|O_EXCL`.
+    ///
+    /// It is not a failure. go-nfs answers NFS3ERR_NOTSUPP on purpose, and the macOS NFS
+    /// client reacts by dropping `O_EXCL` and retrying the create (`nfs3_vnop_create`), so
+    /// the file is created and the app never sees an error. Treating the line as an error
+    /// put a red "Last sync error" banner on healthy Stream profiles that nothing ever
+    /// cleared (a mount never starts or completes a sync, which is what clears it) and
+    /// emitted one "Sync error" ERROR telemetry record per create.
+    ///
+    /// Single source for this match: `LogParser` drops the line, and
+    /// `TelemetryService.categorizeError` buckets it as `exclusive_mode_unsupported`.
+    static func isBenignNFSExclusiveCreateNotice(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return lower.contains("lack of support for") && lower.contains("exclusive")
+    }
+
+    /// EPERM, which Go prints as "operation not permitted". From rclone's local backend this
+    /// is almost always macOS privacy controls (TCC) refusing access to a protected location —
+    /// e.g. `failed to open directory "Photos Library.photoslibrary": open
+    /// /Users/me/Pictures/Photos Library.photoslibrary: operation not permitted`. It is not
+    /// POSIX file permissions ("permission denied", EACCES): chmod can't fix it; only
+    /// excluding the path or granting access in System Settings can.
+    ///
+    /// `TelemetryService.categorizeError` buckets it as `permission_denied`.
+    static func isOperationNotPermitted(_ message: String) -> Bool {
+        message.lowercased().contains("operation not permitted")
+    }
+
+    /// EACCES, which Go prints as "permission denied": POSIX ownership or mode bits refusing a
+    /// path — e.g. the root-owned folders macOS keeps at a volume root:
+    /// `failed to open directory ".Spotlight-V100": open /Volumes/Drive/.Spotlight-V100:
+    /// permission denied`. Full Disk Access can't fix it; excluding the path (or changing its
+    /// permissions, when the user owns it) can.
+    static func isPermissionDenied(_ message: String) -> Bool {
+        message.lowercased().contains("permission denied")
+    }
+
+    /// Why the operating system refused a local path rclone tried to read. The raw values are
+    /// the bounded `error.access_denial` telemetry values.
+    enum BlockedAccessKind: String {
+        /// EPERM ("operation not permitted"): macOS privacy controls (TCC). Granting Full Disk
+        /// Access can fix it.
+        case macOSPrivacy = "operation_not_permitted"
+        /// EACCES ("permission denied"): POSIX ownership or permissions. Privacy settings can't.
+        case filePermissions = "permission_denied"
+    }
+
+    /// The absolute path an "operation not permitted" or "permission denied" error names (the
+    /// path after Go's `open`/`lstat`/… prefix) and which of the two it is, or nil when the
+    /// message names no absolute path — e.g. a remote backend's error. Paths may contain spaces.
+    ///
+    /// Single source for the "blocked access" case: `LogParser` keeps such messages whole (the
+    /// path is what the recovery actions act on), the sync-failure notification summarizes them
+    /// (`macOSBlockedAccessSummary`), `ProfileDetailView` offers Exclude (and, for a privacy
+    /// denial, Open Privacy Settings), and telemetry records the kind, never the path.
+    static func blockedAccess(in message: String) -> (path: String, kind: BlockedAccessKind)? {
+        let pattern = #"(?:^|[\s:])(?:open|lstat|stat|opendir|readlink|mkdir|remove|rename|chmod|chtimes) (/.+?): (operation not permitted|permission denied)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+              let match = regex.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)),
+              let pathRange = Range(match.range(at: 1), in: message),
+              let reasonRange = Range(match.range(at: 2), in: message) else {
+            return nil
+        }
+        let kind: BlockedAccessKind = message[reasonRange].lowercased() == "permission denied"
+            ? .filePermissions : .macOSPrivacy
+        return (String(message[pathRange]), kind)
+    }
+
+    /// The path of `blockedAccess(in:)`, whichever kind it is.
+    static func blockedAccessPath(in message: String) -> String? {
+        blockedAccess(in: message)?.path
+    }
+
+    /// The absolute path an "operation not permitted" (EPERM) error names, or nil — including
+    /// for a "permission denied" error (see `blockedAccess(in:)` for both).
+    static func operationNotPermittedPath(in message: String) -> String? {
+        guard let blocked = blockedAccess(in: message), blocked.kind == .macOSPrivacy else { return nil }
+        return blocked.path
+    }
+
+    /// The path of a local access denial in `message` — EPERM or EACCES — that is the profile's
+    /// local folder or inside it. nil otherwise, including a remote server's error, whose
+    /// absolute path is on the remote, where nothing on this Mac can help.
+    static func macOSBlockedPath(in message: String, localSyncPath: String) -> String? {
+        macOSBlockedAccess(in: message, localSyncPath: localSyncPath)?.path
+    }
+
+    /// `blockedAccess(in:)`, but only for a path that is the profile's local folder or inside it.
+    static func macOSBlockedAccess(in message: String, localSyncPath: String) -> (path: String, kind: BlockedAccessKind)? {
+        guard let blocked = blockedAccess(in: message),
+              SyncExcludeFilter.isWithinSyncFolder(blocked.path, localSyncPath: localSyncPath) else {
+            return nil
+        }
+        return blocked
+    }
+
+    /// One-line user-facing summary of a local access denial — "macOS blocked access to
+    /// “Photos Library.photoslibrary”." for a privacy denial, "SyncTray doesn't have permission
+    /// to access “.Spotlight-V100”." for a permissions one — or nil when `message` isn't one (see
+    /// `macOSBlockedPath`). Names only the last path component, which is what the user
+    /// recognizes.
+    static func macOSBlockedAccessSummary(for message: String, localSyncPath: String) -> String? {
+        guard let blocked = macOSBlockedAccess(in: message, localSyncPath: localSyncPath) else { return nil }
+        let name = (blocked.path as NSString).lastPathComponent
+        let shown = name.isEmpty ? blocked.path : name
+        switch blocked.kind {
+        case .macOSPrivacy: return "macOS blocked access to “\(shown)”."
+        case .filePermissions: return "SyncTray doesn't have permission to access “\(shown)”."
+        }
+    }
+
+    /// True when rclone failed to open a DIRECTORY (the local backend's listing error), as
+    /// opposed to a single file — so an exclude for it ends in `/` (folder and contents).
+    static func isDirectoryOpenFailure(_ message: String) -> Bool {
+        message.lowercased().contains("failed to open directory")
+    }
+
+    /// rclone `sync`/`bisync` refuses to propagate deletions after ANY read error during the
+    /// run ("not deleting files as there were IO errors", "…directories…"), so the
+    /// destination keeps files that were deleted at the source. It is a consequence, not a
+    /// cause — the run's first error says why. `TelemetryService.categorizeError` buckets it
+    /// as `io_errors_blocked_deletes` when that's all a failure has to go on.
+    static func isIOErrorsBlockedDeletes(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return lower.contains("not deleting files as there were io errors")
+            || lower.contains("not deleting directories as there were io errors")
     }
 
     /// Generic messages that don't provide useful error info

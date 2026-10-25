@@ -172,9 +172,16 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         "\(NSHomeDirectory())/Library/LaunchAgents/com.synctray.sync.\(shortId).plist"
     }
 
+    /// Directory holding every profile's sync log. Created owner-only (0700) — the logs
+    /// name every synced file — and tightened at launch by
+    /// `SyncSetupService.tightenPrivateDirectoriesIfLoose()`.
+    static var logDirectory: String {
+        "\(NSHomeDirectory())/.local/log"
+    }
+
     /// Profile-specific log file
     var logPath: String {
-        "\(NSHomeDirectory())/.local/log/synctray-sync-\(shortId).log"
+        "\(Self.logDirectory)/synctray-sync-\(shortId).log"
     }
 
     /// Durable attempt time, independent of launchd loads and profile reinstalls.
@@ -282,6 +289,15 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// (CWE-59). Covered by `ConfigSelfTest` AC-SEC4.
     var mountModePath: String {
         (Self.privateTempDirectory as NSString).appendingPathComponent("synctray-mount-\(shortId).mode")
+    }
+
+    /// Mount mode only — empty marker whose modification time records when SyncTray (the app
+    /// or the CLI) last detached this profile's volume or unloaded its agent on purpose
+    /// (`SyncSetupService.noteDeliberateUnmount`). The mount-interruption telemetry reads it to
+    /// tell a requested unmount from a drop (`MountDropClassifier`). Same per-user 0700 temp
+    /// dir as `mountModePath`, for the same reason: never the shared `/tmp`.
+    var deliberateUnmountMarkerPath: String {
+        (Self.privateTempDirectory as NSString).appendingPathComponent("synctray-unmount-\(shortId).intent")
     }
 
     /// This user's own temp directory (`/var/folders/…/T/`): owned by the user, mode

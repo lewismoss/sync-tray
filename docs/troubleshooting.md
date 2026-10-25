@@ -18,6 +18,7 @@ If `synctray` isn't found, see [Install the CLI](cli.md#install-the-cli).
 - [Cache Only is on, but the mount is still streaming](#cache-only-is-on-but-the-mount-is-still-streaming)
 - [The Finder "Available Offline" menu is missing](#the-finder-available-offline-menu-is-missing)
 - [macOS says the app can't be opened](#macos-says-the-app-cant-be-opened)
+- [Send a diagnostic report](#send-a-diagnostic-report)
 
 ## A sync shows an error
 
@@ -30,6 +31,7 @@ Open the profile in **Settings…** — the error is shown with a button for the
 | Out of sync / cannot find prior listings | Two-way sync lost track of its last state. **Fix Sync Issues** runs a safe resync where the newer copy of each file wins. With auto-fix on (the default), SyncTray does this by itself. |
 | Prior lock file found                  | A previous run left its lock behind. **Remove Lock & Continue** removes this profile's lock once no run is using it, then retries the sync. |
 | Folder is not empty (Stream)           | The mount point already has files in it. Empty the folder, or choose **Mount Anyway** to mount over it. |
+| macOS blocked access / operation not permitted | macOS privacy controls won't let rclone read something in the synced folder — usually an Apple Photos library or a Photo Booth library in `~/Pictures`. Until it's fixed, rclone also skips every deletion ("not deleting files as there were IO errors"). **Exclude from Sync** adds it to the profile's **Don't Sync** list — press **Save** to apply it; **Open Privacy Settings** opens Full Disk Access if you want it synced. These libraries are best excluded: a copy taken while the app is open can be broken. New profiles exclude `*.photoslibrary` and `Photo Booth Library` by default. |
 
 SyncTray never starts a second run of the same profile while one is going, so these buttons tell you when a sync is still in progress instead of starting another.
 
@@ -116,6 +118,23 @@ Update to the latest release.
 To open a build you trust anyway, try to open it once, then allow it under **System Settings → Privacy & Security → Open Anyway**.
 Avoid `xattr -cr` on a downloaded app: it strips the quarantine flag and skips Gatekeeper's checks entirely.
 
+## Send a diagnostic report
+
+When the developer asks for logs, send a diagnostic report instead of digging files out of `~/.local/log`:
+
+1. Open the profile in **Settings…** and choose **Send Report…** — on the "Last sync error" banner, or at the bottom of the profile.
+   For a problem that isn't tied to one profile, use **App Settings → Help & Feedback → Send Diagnostic Report…**.
+2. Pick **This profile** or **All profiles**, and choose **Preview** to read exactly what will be sent.
+3. Choose **Send**, then **Copy** the `ST-XXXXXX` code and give it to the developer on Discord or in your GitHub issue.
+
+The report holds recent sync log lines, your profile settings, and their status.
+Unlike usage data, it can include file and folder names, paths in your home folder (including your username), remote names, and full error messages.
+SyncTray removes the passwords and tokens it recognizes before anything is sent, and nothing is sent until you press **Send** — it works even with usage data off.
+If usage data is on, the report is linked to SyncTray's anonymous install and device IDs.
+**Save to Desktop** writes the same report to a file instead, if you'd rather attach it yourself.
+
+From a terminal: `synctray report <name>` prints the report, and `synctray report <name> --send` sends it and prints the code.
+
 ## Still stuck?
 
-Turn on **Debug Logging** in App Settings, reproduce the problem, and bring the log from `synctray logs <name>` to the [SyncTray Discord](https://discord.gg/KBp8kb3EwP) or a [GitHub issue](https://github.com/mthines/sync-tray/issues).
+Turn on **Debug Logging** in App Settings, reproduce the problem, and [send a diagnostic report](#send-a-diagnostic-report) — or bring the log from `synctray logs <name>` to the [SyncTray Discord](https://discord.gg/KBp8kb3EwP) or a [GitHub issue](https://github.com/mthines/sync-tray/issues).

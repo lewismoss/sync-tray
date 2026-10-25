@@ -67,6 +67,22 @@ struct ProfileDetailView: View {
     @State private var bandwidthLimit: String = ""
     @State private var mountResilient: Bool = true
 
+    // "Don't Sync" patterns — staged-until-Save (plan D6). `syncExcludePatterns` is the form's
+    // current (possibly unsaved) list, edited by `DontSyncSection` and by the macOS-blocked-
+    // access banner's "Exclude from Sync"; `savedSyncExcludePatternsBaseline` is the last value
+    // this form either loaded or adopted from an external edit, so an edit made outside this
+    // form (CLI, a hand-edited file) can still flow in while nothing is staged, without
+    // clobbering an in-progress edit the user hasn't saved yet.
+    @State private var syncExcludePatterns: [String] = []
+    @State private var savedSyncExcludePatternsBaseline: [String] = []
+
+    /// A confirmed "Stop the Current Sync and Apply?" Save still in flight — the profile value
+    /// to persist once the user presses "Stop and Apply" (plan D7). `showingStopAndApplyConfirm`
+    /// drives the alert's `isPresented` directly (a plain `Bool`, not a derived `Binding`, keeps
+    /// the already-large `body` ViewBuilder expression within the type-checker's time budget).
+    @State private var pendingStopAndApplyProfile: SyncProfile?
+    @State private var showingStopAndApplyConfirm: Bool = false
+
     // UI State
     @State private var showAdvanced: Bool = false
     @State private var isInstalling: Bool = false
@@ -149,6 +165,9 @@ struct ProfileDetailView: View {
     // leaves those other fields un-applied (finding 12).
     @State private var cacheMoveOtherFieldsNeedReinstall = false
 
+    // "Send Diagnostic Report" sheet (banner "Send Report…" and the footer button)
+    @State private var showingDiagnosticReport: Bool = false
+
     private let setupService = SyncSetupService.shared
 
     // MARK: - Computed Properties
@@ -184,30 +203,37 @@ struct ProfileDetailView: View {
     }
 
     private var hasChanges: Bool {
-        name != profile.name ||
-        rcloneRemote != profile.rcloneRemote ||
-        remotePath != profile.remotePath ||
-        localSyncPath != profile.localSyncPath ||
-        computedDrivePath != profile.drivePathToMonitor ||
-        syncIntervalMinutes != profile.syncIntervalMinutes ||
-        syncOnLocalChanges != profile.syncOnLocalChanges ||
-        (syncMode != .mount && !isScheduleValid) ||
-        additionalRcloneFlags != profile.additionalRcloneFlags ||
-        syncMode != profile.syncMode ||
-        syncDirection != profile.syncDirection ||
-        (fallbackEnabled ? fallbackRemote : "") != profile.fallbackRemote ||
-        ((fallbackEnabled && fallbackUseDifferentPath) ? fallbackRemotePath : "") != profile.fallbackRemotePath ||
-        mountBackend != profile.mountBackend ||
-        vfsCacheMode != profile.vfsCacheMode ||
-        vfsCacheMaxSize != profile.vfsCacheMaxSize ||
-        vfsCacheMaxAge != profile.vfsCacheMaxAge ||
-        vfsCachePath != profile.vfsCachePath ||
-        allowNonEmptyMount != profile.allowNonEmptyMount ||
-        mountAtStartup != profile.mountAtStartup ||
-        streamCacheOnly != profile.streamCacheOnly ||
-        downloadConnections != profile.downloadConnections ||
-        SyncProfile.normalizedBandwidthLimit(bandwidthLimit) != profile.bandwidthLimit ||
-        mountResilient != profile.mountResilient
+        // Split into sub-expressions — one combined `||` chain over every field is slow enough
+        // for the type-checker to time out (it did, once `syncExcludePatterns` was the straw
+        // that broke it).
+        let coreFieldsChanged =
+            name != profile.name ||
+            rcloneRemote != profile.rcloneRemote ||
+            remotePath != profile.remotePath ||
+            localSyncPath != profile.localSyncPath ||
+            computedDrivePath != profile.drivePathToMonitor ||
+            syncIntervalMinutes != profile.syncIntervalMinutes ||
+            syncOnLocalChanges != profile.syncOnLocalChanges ||
+            (syncMode != .mount && !isScheduleValid) ||
+            additionalRcloneFlags != profile.additionalRcloneFlags ||
+            syncMode != profile.syncMode ||
+            syncDirection != profile.syncDirection ||
+            (fallbackEnabled ? fallbackRemote : "") != profile.fallbackRemote ||
+            ((fallbackEnabled && fallbackUseDifferentPath) ? fallbackRemotePath : "") != profile.fallbackRemotePath
+        let mountFieldsChanged =
+            mountBackend != profile.mountBackend ||
+            vfsCacheMode != profile.vfsCacheMode ||
+            vfsCacheMaxSize != profile.vfsCacheMaxSize ||
+            vfsCacheMaxAge != profile.vfsCacheMaxAge ||
+            vfsCachePath != profile.vfsCachePath ||
+            allowNonEmptyMount != profile.allowNonEmptyMount ||
+            mountAtStartup != profile.mountAtStartup ||
+            streamCacheOnly != profile.streamCacheOnly ||
+            downloadConnections != profile.downloadConnections ||
+            SyncProfile.normalizedBandwidthLimit(bandwidthLimit) != profile.bandwidthLimit ||
+            mountResilient != profile.mountResilient
+        let syncFilterFieldsChanged = syncExcludePatterns != profile.syncExcludePatterns
+        return coreFieldsChanged || mountFieldsChanged || syncFilterFieldsChanged
     }
 
     /// Display name for the mount folder, used in the offline-access caption
@@ -285,6 +311,23 @@ struct ProfileDetailView: View {
         localDirectoryItemCount > 0
     }
 
+    /// Built with an EXPLICIT type annotation (not inferred inline in `body`'s modifier chain)
+    /// — constructing this `ViewModifier` directly inside the already-large `body` expression
+    /// is what pushed the type-checker past its time budget; a separately-typed computed
+    /// property gives the compiler a much smaller expression to solve.
+    private var stagedSyncExcludePatternsModifier: StagedSyncExcludePatternsModifier {
+        StagedSyncExcludePatternsModifier(
+            profileSyncExcludePatterns: profile.syncExcludePatterns,
+            syncExcludePatterns: $syncExcludePatterns,
+            savedSyncExcludePatternsBaseline: $savedSyncExcludePatternsBaseline,
+            pendingStopAndApplyProfile: $pendingStopAndApplyProfile,
+            showingStopAndApplyConfirm: $showingStopAndApplyConfirm,
+            onConfirmStopAndApply: { [self] updated in
+                applyFilterSaveAndFollowUp(current: profile, updated: updated, followUp: .confirmStopThenSync)
+            }
+        )
+    }
+
     // MARK: - Body
 
     var body: some View {
@@ -335,7 +378,8 @@ struct ProfileDetailView: View {
                             profileStore: profileStore,
                             syncManager: syncManager,
                             syncMode: syncMode,
-                            syncDirection: syncDirection
+                            syncDirection: syncDirection,
+                            patterns: $syncExcludePatterns
                         )
 
                         // Sync Only These Folders (selective folders, Option A) — syncs just
@@ -405,6 +449,11 @@ struct ProfileDetailView: View {
                 availableFolders = []
             }
         }
+        // Staged "Don't Sync" edits + the stop-then-apply confirm (plan D6/D7) — pulled into a
+        // dedicated `ViewModifier` (below `DontSyncSection`) so its closures are type-checked
+        // independently of this already-large modifier chain, which otherwise blows the
+        // type-checker's time budget.
+        .modifier(stagedSyncExcludePatternsModifier)
         .alert("Uninstall Scheduled Sync?", isPresented: $showingUninstallConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Uninstall", role: .destructive) { uninstallSync() }
@@ -487,6 +536,12 @@ struct ProfileDetailView: View {
                     onDismiss: { showingCacheMoveSheet = false }
                 )
             }
+        }
+        .sheet(isPresented: $showingDiagnosticReport) {
+            DiagnosticReportSheet(
+                allProfiles: profileStore.profiles,
+                focusProfile: profileStore.profile(for: profile.id) ?? profile
+            )
         }
         .alert("Delete Remote?", isPresented: $showingDeleteRemoteConfirm) {
             Button("Cancel", role: .cancel) {
@@ -1292,8 +1347,11 @@ struct ProfileDetailView: View {
                         .background(Color.red.opacity(0.1))
                         .cornerRadius(4)
 
-                    // Action buttons for common errors
-                    if let errorAction = detectErrorAction(from: lastError) {
+                    // macOS privacy denial: its own two actions (exclude / allow access)
+                    if let blockedPath = SyncLogPatterns.macOSBlockedPath(in: lastError, localSyncPath: profile.localSyncPath) {
+                        macOSBlockedAccessActions(blockedPath: blockedPath, error: lastError)
+                    } else if let errorAction = detectErrorAction(from: lastError) {
+                        // Action buttons for common errors
                         VStack(alignment: .leading, spacing: 6) {
                             // Show additional context for "too many deletes" error
                             if errorAction == .forceSync {
@@ -1369,6 +1427,16 @@ struct ProfileDetailView: View {
                         }
                     }
 
+                    // Manual diagnostic report — the user chooses to send this error's
+                    // context (log lines, settings, status) to the developer.
+                    Button {
+                        showingDiagnosticReport = true
+                    } label: {
+                        Label("Send Report…", systemImage: "paperplane")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Send a diagnostic report about this error to the SyncTray developer")
                 }
             }
 
@@ -2137,6 +2205,13 @@ struct ProfileDetailView: View {
 
     private var actionButtons: some View {
         HStack {
+            Button {
+                showingDiagnosticReport = true
+            } label: {
+                Label("Send Report…", systemImage: "paperplane")
+            }
+            .help("Send a diagnostic report for this profile to the SyncTray developer")
+
             if hasChanges {
                 Text("You have unsaved changes")
                     .font(.caption)
@@ -2196,6 +2271,8 @@ struct ProfileDetailView: View {
         downloadConnections = profile.downloadConnections
         bandwidthLimit = profile.bandwidthLimit
         mountResilient = profile.mountResilient
+        syncExcludePatterns = profile.syncExcludePatterns
+        savedSyncExcludePatternsBaseline = profile.syncExcludePatterns
 
         // Show text input if the path contains "/" (nested path) or is a custom path
         // that won't be in the folder picker dropdown
@@ -2233,9 +2310,11 @@ struct ProfileDetailView: View {
         updatedProfile.downloadConnections = downloadConnections
         updatedProfile.bandwidthLimit = SyncProfile.normalizedBandwidthLimit(bandwidthLimit)
         updatedProfile.mountResilient = mountResilient
-        // Lists edited outside the form and saved the moment they change ("Don't Sync",
-        // "Don't Download", pinned folders): take them from the store, so a Save can never
-        // write back an older copy held by this view.
+        // Lists edited outside the form and saved the moment they change ("Sync Only These
+        // Folders", "Don't Download", pinned folders): take them from the store, so a Save can
+        // never write back an older copy held by this view. "Don't Sync" (syncExcludePatterns)
+        // is staged form state instead — the placeholder read here is overwritten by
+        // `saveProfile()` with the staged list before it writes.
         if let live = profileStore.profile(for: profile.id) {
             updatedProfile.syncExcludePatterns = live.syncExcludePatterns
             updatedProfile.syncIncludeFolders = live.syncIncludeFolders
@@ -2334,7 +2413,11 @@ struct ProfileDetailView: View {
             return
         }
 
-        let updatedProfile = buildProfileFromForm()
+        var updatedProfile = buildProfileFromForm()
+        // Overlay the staged "Don't Sync" patterns here only — `buildProfileFromForm()` keeps
+        // reading the store's patterns so Install/Reinstall/Mount Anyway and the cache-move
+        // cancel path can never write back a stale or unsaved list (plan D6).
+        updatedProfile.syncExcludePatterns = syncExcludePatterns
         let currentProfile = profile
 
         // Refuse a Cache Directory change while Cache Only files wait to upload: the overlay
@@ -2386,6 +2469,9 @@ struct ProfileDetailView: View {
         // so `hasChanges` goes false and Save becomes unavailable to retry. Checking
         // here instead means the edit is never persisted at all until it can actually
         // take effect: the form stays dirty and Save works again once the run ends.
+        // A reinstall-needing Save while the run is live keeps today's refusal (plan D8):
+        // extending stop-then-apply to a reinstall would change Rule 8's reinstall semantics,
+        // which the user did not ask for. The form stays dirty; the alert says to press Abort.
         if needsReinstall, syncManager.isRunLive(for: currentProfile) {
             showingSyncInProgressAlert = true
             TelemetryService.shared.recordProfileLifecycleOperation(
@@ -2396,14 +2482,60 @@ struct ProfileDetailView: View {
             return
         }
 
-        profileStore.update(updatedProfile)
+        // A reinstall's own agent load (RunAtLoad) starts the sync, so `filterSaveFollowUp`
+        // returns `.none` whenever `needsReinstall` is true — this decision only matters for a
+        // filter-only Save (plan D7).
+        let followUp = SyncManager.filterSaveFollowUp(
+            filterChanged: SyncManager.syncFilterReconcileNeeded(from: currentProfile, to: updatedProfile),
+            needsReinstall: needsReinstall,
+            runLive: syncManager.isRunLive(for: currentProfile),
+            installed: isInstalled
+        )
 
-        // Clear any cached error since config changed
-        syncManager.clearError(for: profile.id)
+        // A live run needs confirmation before SyncTray stops it — nothing is persisted until
+        // the user presses "Stop and Apply" (plan D7), so Cancel leaves the form exactly as
+        // dirty as it was.
+        if followUp == .confirmStopThenSync {
+            pendingStopAndApplyProfile = updatedProfile
+            showingStopAndApplyConfirm = true
+            return
+        }
+
+        applyFilterSaveAndFollowUp(current: currentProfile, updated: updatedProfile, followUp: followUp)
 
         // Only reinstall if sync-related settings changed
         if needsReinstall {
             reinstallSync(previous: currentProfile)
+        }
+    }
+
+    /// Persist the profile, write the "Don't Sync" filter if it changed, clear any stale error,
+    /// and perform the follow-up `filterSaveFollowUp` decided (plan D7): `.syncNow` starts a
+    /// sync immediately, `.confirmStopThenSync` stops the live run first (only called here once
+    /// the user has confirmed), `.none` does nothing further. The filter is written BEFORE any
+    /// stop-then-sync request — the live run already read its `--filter-from` at launch, so
+    /// writing mid-run can't change it, and this ordering keeps "saved == applied on disk" true
+    /// even if the abort gives up or the window closes during the up-to-90s wait.
+    private func applyFilterSaveAndFollowUp(current: SyncProfile, updated: SyncProfile, followUp: FilterSaveFollowUp) {
+        profileStore.update(updated)
+        syncManager.applySyncFilterReconcile(from: current, to: updated)
+        syncManager.clearError(for: updated.id)
+        guard syncManager.syncFilterErrors[updated.id] == nil else { return }
+        switch followUp {
+        case .none:
+            break
+        case .syncNow:
+            syncManager.triggerManualSync(for: updated)
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: updated.id, profileName: updated.name,
+                operation: "apply_sync_filter", syncMode: updated.syncMode.rawValue, result: "sync_now"
+            )
+        case .confirmStopThenSync:
+            syncManager.stopRunThenSync(for: updated)
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: updated.id, profileName: updated.name,
+                operation: "apply_sync_filter", syncMode: updated.syncMode.rawValue, result: "stop_requested"
+            )
         }
     }
 
@@ -3270,7 +3402,9 @@ struct ProfileDetailView: View {
 
             // Ensure log directory exists (append to existing log, don't truncate)
             let logDir = (syncLogPath as NSString).deletingLastPathComponent
-            try? fileManager.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+            try? fileManager.createDirectory(
+                atPath: logDir, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
 
             // Create file if it doesn't exist
             if !fileManager.fileExists(atPath: syncLogPath) {
@@ -3343,9 +3477,22 @@ struct ProfileDetailView: View {
                 arguments.append("--no-check-certificate")
             }
 
-            // Add any additional flags from profile
+            // Add any additional flags from profile, split exactly as the sync script splits
+            // them (`SyncSetupService.splitAdditionalFlags`) — a whitespace split broke quoted
+            // values and skipped `~` / `$VAR`, so this resync ran different filters (#123).
             if !capturedAdditionalFlags.isEmpty {
-                let extraFlags = capturedAdditionalFlags.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                guard let extraFlags = SyncSetupService.splitAdditionalFlags(capturedAdditionalFlags) else {
+                    let errMsg = "Error: Additional rclone flags could not be parsed (unbalanced quote or trailing backslash) - not running rclone"
+                    writeToLog(errMsg)
+                    SyncRunLock.releaseIfOwned(path: capturedLockPath, ownTokens: [placeholder])
+                    DispatchQueue.main.async {
+                        self.syncManager.endExclusiveRun(runToken)
+                        self.isRunningResync = false
+                        self.resyncOutputLines = [errMsg]
+                        self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
+                    }
+                    return
+                }
                 arguments.append(contentsOf: extraFlags)
             }
 
@@ -3685,6 +3832,8 @@ struct ProfileDetailView: View {
         case retrySync
         case forceSync      // Override "too many deletes" safety check
         case mountAnyway    // Enable non-empty mount and retry
+        case excludeBlockedPath   // macOS blocked access: add the path to "Don't Sync", sync again
+        case openPrivacySettings  // macOS blocked access: open Full Disk Access in System Settings
 
         /// Bounded, low-cardinality id for telemetry (`recovery.action`).
         var telemetryName: String {
@@ -3697,6 +3846,8 @@ struct ProfileDetailView: View {
             case .retrySync: return "retry"
             case .forceSync: return "force_sync"
             case .mountAnyway: return "mount_anyway"
+            case .excludeBlockedPath: return "exclude_blocked_path"
+            case .openPrivacySettings: return "open_privacy_settings"
             }
         }
 
@@ -3718,6 +3869,10 @@ struct ProfileDetailView: View {
                 return "Force Sync (Override Safety)"
             case .mountAnyway:
                 return "Mount Anyway"
+            case .excludeBlockedPath:
+                return "Exclude from Sync"
+            case .openPrivacySettings:
+                return "Open Privacy Settings"
             }
         }
 
@@ -3739,6 +3894,10 @@ struct ProfileDetailView: View {
                 return "Force syncing..."
             case .mountAnyway:
                 return "Mounting..."
+            case .excludeBlockedPath:
+                return "Adding to Don't Sync..."
+            case .openPrivacySettings:
+                return "Opening..."
             }
         }
 
@@ -3760,6 +3919,10 @@ struct ProfileDetailView: View {
                 return "exclamationmark.triangle"
             case .mountAnyway:
                 return "folder.badge.plus"
+            case .excludeBlockedPath:
+                return "minus.circle"
+            case .openPrivacySettings:
+                return "lock.shield"
             }
         }
 
@@ -3781,6 +3944,10 @@ struct ProfileDetailView: View {
                 return "Override the 50% deletion safety limit and proceed with sync"
             case .mountAnyway:
                 return "Enable mounting to non-empty folder and retry"
+            case .excludeBlockedPath:
+                return "Add the blocked item to this profile's Don't Sync list below — press Save to apply"
+            case .openPrivacySettings:
+                return "Open System Settings › Privacy & Security › Full Disk Access"
             }
         }
     }
@@ -3846,7 +4013,12 @@ struct ProfileDetailView: View {
         // Defense in depth: the buttons that call this already gate on
         // `isSyncRunningForProfile`, but check liveness again here so every path
         // into a recovery action — not just the button tap — is covered (R1).
-        guard !syncManager.isRunLive(for: profile) else {
+        // Open Privacy Settings and Exclude from Sync are both exempt: Open Privacy
+        // Settings only opens System Settings, and Exclude from Sync only stages a
+        // pattern into the form's "Don't Sync" state (D9) — neither starts a run, so
+        // refusing either while a sync is live would block the fix for nothing.
+        guard action == .openPrivacySettings || action == .excludeBlockedPath
+            || !syncManager.isRunLive(for: profile) else {
             TelemetryService.shared.recordUserRecoveryAction(
                 profileId: profile.id,
                 profileName: profile.name,
@@ -3860,7 +4032,7 @@ struct ProfileDetailView: View {
             profileId: profile.id,
             profileName: profile.name,
             action: action.telemetryName,
-            result: "started"
+            result: action == .excludeBlockedPath ? "staged" : "started"
         )
         switch action {
         case .smartFix:
@@ -3879,6 +4051,137 @@ struct ProfileDetailView: View {
             runForceSync()
         case .mountAnyway:
             enableNonEmptyMountAndReinstall()
+        case .excludeBlockedPath:
+            stageBlockedPathExclusion()
+        case .openPrivacySettings:
+            openPrivacySettings()
+        }
+    }
+
+    // MARK: - macOS Blocked Access
+
+    /// Recovery for an rclone error naming a local path it wasn't allowed to read
+    /// (`SyncLogPatterns.macOSBlockedAccess`): either macOS privacy controls (EPERM) —
+    /// typically an Apple Photos or Photo Booth library inside the synced folder — or file
+    /// permissions (EACCES) — typically a root-owned system folder at the root of an external
+    /// drive. Ways out: exclude the path from this profile (staged into the "Don't Sync" list
+    /// below, where the user can see, edit, or undo it before Save applies it), or, for a
+    /// privacy denial only, allow access in System Settings — Full Disk Access does nothing for
+    /// a permissions denial, so that button is not offered there. Which process needs that
+    /// access for a scheduled sync is deliberately not named: launchd runs the sync script
+    /// directly, not as a child of SyncTray.
+    @ViewBuilder
+    private func macOSBlockedAccessActions(blockedPath: String, error: String) -> some View {
+        let excludePattern = blockedAccessExcludePattern(blockedPath: blockedPath, error: error)
+        // Only "unsaved" while it's staged in the form but NOT yet in the saved profile — once
+        // Save applies it, the pattern is in `profile.syncExcludePatterns` too, and the banner
+        // must stop claiming it's unsaved (there's nothing left to Save for this pattern, and
+        // the button would otherwise stay stuck on "Excluded (unsaved)" forever).
+        let alreadyStaged = excludePattern.map {
+            syncExcludePatterns.contains($0) && !profile.syncExcludePatterns.contains($0)
+        } ?? false
+        let name = (blockedPath as NSString).lastPathComponent
+        let kind = SyncLogPatterns.blockedAccess(in: error)?.kind ?? .macOSPrivacy
+        VStack(alignment: .leading, spacing: 6) {
+            if let summary = SyncLogPatterns.macOSBlockedAccessSummary(for: error, localSyncPath: profile.localSyncPath) {
+                Text(summary)
+                    .font(.caption.weight(.medium))
+            }
+            Text(blockedAccessExplanation(itemName: name, kind: kind, canExclude: excludePattern != nil))
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if alreadyStaged {
+                Text("Added to Don't Sync below — press Save to apply.")
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(.secondary)
+            }
+            HStack(spacing: 8) {
+                if excludePattern != nil {
+                    Button(action: { handleErrorAction(.excludeBlockedPath) }) {
+                        Label(alreadyStaged ? "Excluded (unsaved)" : ErrorAction.excludeBlockedPath.buttonText,
+                              systemImage: alreadyStaged ? "checkmark.circle" : ErrorAction.excludeBlockedPath.icon)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(alreadyStaged)
+                    .help(ErrorAction.excludeBlockedPath.helpText)
+                }
+                if kind == .macOSPrivacy {
+                    Button(action: { handleErrorAction(.openPrivacySettings) }) {
+                        Label(ErrorAction.openPrivacySettings.buttonText,
+                              systemImage: ErrorAction.openPrivacySettings.icon)
+                    }
+                    .buttonStyle(.bordered)
+                    .help(ErrorAction.openPrivacySettings.helpText)
+                }
+            }
+        }
+    }
+
+    private func blockedAccessExplanation(itemName: String, kind: SyncLogPatterns.BlockedAccessKind, canExclude: Bool) -> String {
+        var text: String
+        switch kind {
+        case .macOSPrivacy:
+            text = canExclude
+                ? "Exclude it from this profile to finish syncing, or allow access under System Settings › "
+                    + "Privacy & Security › Full Disk Access."
+                : "Allow access under System Settings › Privacy & Security › Full Disk Access, then sync again."
+        case .filePermissions:
+            if SyncExcludeFilter.volumeSystemFolderNames.contains(itemName) {
+                text = "It's a folder macOS keeps at the root of the drive, owned by the system — it never "
+                    + "holds your files. Exclude it from this profile to finish syncing."
+            } else {
+                text = canExclude
+                    ? "Its permissions don't let SyncTray access it. Exclude it from this profile to finish syncing, "
+                        + "or give yourself Read & Write access in Finder › Get Info › Sharing & Permissions."
+                    : "Its permissions don't let SyncTray access it. Give yourself Read & Write access in Finder › Get Info › "
+                        + "Sharing & Permissions, then sync again."
+            }
+        }
+        text += " Until then, files deleted on one side aren't deleted on the other."
+        if itemName.lowercased().hasSuffix(".photoslibrary") {
+            text += " Apple Photos libraries are best excluded: copying one while Photos is open can "
+                + "produce a broken copy."
+        } else if itemName.caseInsensitiveCompare("Photo Booth Library") == .orderedSame {
+            text += " Photo Booth libraries are best excluded: copying one while Photo Booth is open can "
+                + "produce a broken copy."
+        }
+        return text
+    }
+
+    /// The "Don't Sync" pattern that excludes `blockedPath` from this profile, or nil when it
+    /// can't be excluded: a Stream profile has no sync filter, and a path that is the sync
+    /// folder itself or outside it can't be matched by a pattern.
+    private func blockedAccessExcludePattern(blockedPath: String, error: String) -> String? {
+        guard !profile.isMountMode else { return nil }
+        var isDirectory: ObjCBool = false
+        let existsAsDirectory = FileManager.default.fileExists(atPath: blockedPath, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+        return SyncExcludeFilter.excludePattern(
+            forBlockedPath: blockedPath,
+            localSyncPath: profile.localSyncPath,
+            isDirectory: SyncLogPatterns.isDirectoryOpenFailure(error) || existsAsDirectory
+        )
+    }
+
+    /// Stage the blocked path into the form's "Don't Sync" list (D9) — appends the anchored
+    /// pattern to `syncExcludePatterns` if it isn't already there, and touches nothing else:
+    /// no filter-file write, no error clear, no sync trigger. It shows up in the "Don't Sync"
+    /// editor below immediately (undoable like any other staged edit) and only takes effect
+    /// once the user presses Save, which runs it through `filterSaveFollowUp`.
+    private func stageBlockedPathExclusion() {
+        guard let lastError = syncManager.lastError(for: profile.id),
+              let blockedPath = SyncLogPatterns.macOSBlockedPath(in: lastError, localSyncPath: profile.localSyncPath),
+              let pattern = blockedAccessExcludePattern(blockedPath: blockedPath, error: lastError) else {
+            return
+        }
+        guard !syncExcludePatterns.contains(pattern) else { return }
+        syncExcludePatterns.append(pattern)
+    }
+
+    private func openPrivacySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
         }
     }
 
@@ -4004,7 +4307,9 @@ struct ProfileDetailView: View {
 
             // Ensure log directory exists
             let logDir = (syncLogPath as NSString).deletingLastPathComponent
-            try? fileManager.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+            try? fileManager.createDirectory(
+                atPath: logDir, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
 
             if !fileManager.fileExists(atPath: syncLogPath) {
                 fileManager.createFile(atPath: syncLogPath, contents: nil)
@@ -4412,7 +4717,9 @@ struct ProfileDetailView: View {
         // Create log directory if needed
         let logDir = (logPath as NSString).deletingLastPathComponent
         if !fileManager.fileExists(atPath: logDir) {
-            try? fileManager.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+            try? fileManager.createDirectory(
+                atPath: logDir, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
         }
 
         // Append to log file
@@ -4445,12 +4752,57 @@ struct ProfileDetailView: View {
     }
 }
 
+// MARK: - Staged "Don't Sync" + stop-then-apply confirm (plan D6/D7)
+
+/// Pulled out of `ProfileDetailView.body`'s modifier chain into its own `ViewModifier` so its
+/// `onChange`/`alert` closures are type-checked as a separate declaration — inlined, they
+/// pushed the already-large `body` expression past the type-checker's time budget.
+///
+/// Two responsibilities:
+/// 1. External-edit adoption — a CLI or hand-edited-file change to `syncExcludePatterns` is
+///    adopted into the form ONLY while the form has no staged edit of its own (the baseline
+///    rule): an in-progress unsaved edit always wins over an external change until the user
+///    explicitly Saves or Reverts.
+/// 2. The "Stop the Current Sync and Apply?" confirm a filter-changing Save shows when the
+///    profile's run is live (plan D7) — persists nothing until the user presses "Stop and Apply".
+private struct StagedSyncExcludePatternsModifier: ViewModifier {
+    let profileSyncExcludePatterns: [String]
+    @Binding var syncExcludePatterns: [String]
+    @Binding var savedSyncExcludePatternsBaseline: [String]
+    @Binding var pendingStopAndApplyProfile: SyncProfile?
+    @Binding var showingStopAndApplyConfirm: Bool
+    let onConfirmStopAndApply: (SyncProfile) -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: profileSyncExcludePatterns) { newValue in
+                if syncExcludePatterns == savedSyncExcludePatternsBaseline {
+                    syncExcludePatterns = newValue
+                }
+                savedSyncExcludePatternsBaseline = newValue
+            }
+            .alert("Stop the Current Sync and Apply?", isPresented: $showingStopAndApplyConfirm) {
+                Button("Cancel", role: .cancel) { pendingStopAndApplyProfile = nil }
+                Button("Stop and Apply", role: .destructive) {
+                    if let updated = pendingStopAndApplyProfile {
+                        onConfirmStopAndApply(updated)
+                    }
+                    pendingStopAndApplyProfile = nil
+                }
+            } message: {
+                Text("The running sync still uses the old \"Don't Sync\" rules. SyncTray stops it "
+                    + "(it finishes the files it's transferring first, which can take up to about a "
+                    + "minute and a half), saves the changes, then starts a new sync.")
+            }
+    }
+}
+
 // MARK: - Don't Sync
 
 /// "Don't Sync" patterns for Two-Way and One-Way profiles: the same pattern list and syntax
 /// as Offline Files' "Don't Download", stored in `syncExcludePatterns` and written as rclone
-/// exclude rules into the profile's filter file. Edits save immediately (like "Don't
-/// Download") and apply from the next sync — no reinstall.
+/// exclude rules into the profile's filter file. Staged until the form's Save applies them
+/// (plan D6) — the live run keeps using the old rules until then.
 struct DontSyncSection: View {
     let profile: SyncProfile
     @ObservedObject var profileStore: ProfileStore
@@ -4459,12 +4811,10 @@ struct DontSyncSection: View {
     /// user is looking at.
     let syncMode: SyncMode
     let syncDirection: SyncDirection
-
-    @State private var patterns: [String] = []
-
-    private var liveProfile: SyncProfile {
-        profileStore.profile(for: profile.id) ?? profile
-    }
+    /// The form's staged (possibly unsaved) pattern list — owned by `ProfileDetailView`, not
+    /// this section (plan D6). External-edit adoption and the stop-then-apply confirm live in
+    /// `StagedSyncExcludePatternsModifier`, attached once at the top-level form, not here.
+    @Binding var patterns: [String]
 
     private var remoteName: String {
         let name = profile.rcloneRemote.hasSuffix(":")
@@ -4486,7 +4836,7 @@ struct DontSyncSection: View {
         }
         var text = effect + " Use wildcards: *.bak matches any file ending in .bak, and "
             + "**/BACKUP/** skips every folder named BACKUP, at any depth. Patterns are "
-            + "case-sensitive and apply from the next sync."
+            + "case-sensitive and apply when you Save."
         if syncMode == .bisync {
             text += " A new pattern that covers more than half of the files stops two-way sync "
                 + "at its mass-deletion safety check until you remove it, so add broad "
@@ -4504,7 +4854,6 @@ struct DontSyncSection: View {
                 patterns: patterns
             ) { updated in
                 patterns = updated
-                syncManager.updateSyncExcludePatterns(updated, for: profile.id)
             }
 
             // Kept by SyncManager, not this view: it survives the view being recreated and
@@ -4516,16 +4865,6 @@ struct DontSyncSection: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .onAppear { patterns = liveProfile.syncExcludePatterns }
-        .onChange(of: profile.id) { _ in
-            patterns = liveProfile.syncExcludePatterns
-        }
-        // Mirror edits made outside this view (CLI, a hand-edited .profile.json).
-        .onReceive(profileStore.$profiles) { profiles in
-            guard let updated = profiles.first(where: { $0.id == profile.id }),
-                  updated.syncExcludePatterns != patterns else { return }
-            patterns = updated.syncExcludePatterns
-        }
     }
 }
 
@@ -4533,7 +4872,8 @@ struct DontSyncSection: View {
 /// for a two-way profile, uploaded/downloaded for a one-way profile) instead of everything
 /// under the profile's root pair. Folders are literal paths relative to `remotePath` (and,
 /// symmetrically, `localSyncPath`) — picked via `RemoteFolderBrowserSheet` in multi-select
-/// mode, or typed by hand. Applies immediately on change, exactly like `DontSyncSection`.
+/// mode, or typed by hand. Applies immediately on change — unlike `DontSyncSection`'s "Don't
+/// Sync" patterns, which now stage into the form until Save.
 struct SyncOnlyFoldersSection: View {
     let profile: SyncProfile
     @ObservedObject var profileStore: ProfileStore

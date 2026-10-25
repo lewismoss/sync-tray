@@ -188,7 +188,7 @@ Skip files by pattern — for example `*.rpp-bak` for every Reaper backup, or `*
 
 - Matching files stop syncing. Nothing is deleted on either side.
 - Patterns are case-sensitive: `*` matches within one folder name, `?` one character, and `**` any number of folders.
-- Changes apply from the next sync, with no re-sync.
+- Changes apply when you press **Save** — editing the list alone doesn't sync anything. Save offers to stop a running sync and apply right away, or starts a sync immediately when the profile is idle.
 - On a two-way profile, add broad patterns in steps. Excluding more than half of the files at once trips the [mass-deletion stop](#two-way-sync).
 
 ### Sync Only These Folders
@@ -210,8 +210,8 @@ Sync only the folders you list and leave everything else alone.
 
 | Icon                        | State             | Meaning                               |
 | --------------------------- | ----------------- | ------------------------------------- |
-| Gray sync arrows            | Idle              | Everything is up to date              |
-| Blue sync arrows            | Syncing           | A sync is running                     |
+| Gray ring                   | Idle              | Everything is up to date              |
+| Blue ring filling up        | Syncing           | A sync is running, with its progress  |
 | Gray pause circle           | Paused            | The profile is paused                 |
 | Red warning triangle        | Error             | The last sync failed — open the log   |
 | Orange drive with an X      | Drive not mounted | The profile's external drive is unplugged |
@@ -222,6 +222,7 @@ Sync only the folders you list and leave everything else alone.
 </p>
 
 - **Live progress:** bytes, file counts, and the files in flight, for syncs and for streamed files.
+- **Hard to see the icon?** Change its colors in [App settings](#app-settings) → **Menu Bar Icon**.
 - **Recent changes:** the last 20 transferred files, each marked copied, updated, deleted, or renamed. Click one to show it in Finder.
 - **Notifications** are batched: up to 3 files are listed by name, more are summarized. Click to open the folder. Mute a profile from its bell icon.
 - **View Log** opens the profile's sync log.
@@ -245,6 +246,10 @@ Syncs pause while the drive is unplugged and resume when it's back.
 Open **Settings…** and click the gear in the sidebar.
 
 - **Launch at Login.**
+- **Menu Bar Icon** — how the menu bar icon is drawn, for when it's hard to see against your wallpaper:
+  - **Color** (default): blue while syncing, gray when idle.
+  - **Monochrome**: drawn in the menu bar's own text color, black or white, like Apple's icons. The easiest to see on any wallpaper or in dark mode.
+  - **Custom**: pick the ring's color while syncing and when idle. Paused, error, and drive symbols keep their usual colors.
 - **Automatically recover from sync conflicts** — the two-way auto-fix described above.
 - **Share usage data** — off until you turn it on. Sends pseudonymous usage and error data, never file names, folder names, remote names, or credentials. **Learn more** shows exactly what's collected.
 - **Debug Logging** — verbose lines in the sync logs, for troubleshooting.

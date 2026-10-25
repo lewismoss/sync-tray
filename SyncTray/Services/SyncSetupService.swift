@@ -22,7 +22,12 @@ final class SyncSetupService {
         # macOS metadata
         - ._*
         - .DS_Store
-        - .fseventsd
+
+        \(SyncExcludeFilter.volumeSystemFoldersSection)
+
+        \(SyncExcludeFilter.photosLibrarySection)
+
+        \(SyncExcludeFilter.DefaultExclude.photoBoothLibrary.section)
 
         # Windows thumbs/previews
         - Thumbs.db
@@ -118,6 +123,34 @@ final class SyncSetupService {
               let config = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
               let onDisk = config["mountModePath"] as? String else { return false }
         return onDisk != expected
+    }
+
+    /// Tighten the sync-log and profile directories that earlier versions created with the
+    /// default mode (0755). The logs name every synced file and the profile JSON names
+    /// remotes, local paths and extra rclone flags, so neither should be listable by other
+    /// local accounts. New installs create both 0700; this fixes existing ones. Called once
+    /// per launch, next to `RcloneConfigService.tightenConfigPermissionsIfLoose()`.
+    static func tightenPrivateDirectoriesIfLoose() {
+        tightenDirectoryIfLoose(atPath: SyncProfile.logDirectory)
+        tightenDirectoryIfLoose(atPath: SyncProfile.configDirectory)
+    }
+
+    /// Drop group/other bits from `path` when it is a real directory owned by this user.
+    /// Nothing is created and nothing below it is touched. `attributesOfItem` does not
+    /// follow a final symlink, so a symlinked directory is left alone. Returns true only
+    /// when the mode was changed. Covered by `ConfigSelfTest` AC-SEC5.
+    @discardableResult
+    static func tightenDirectoryIfLoose(atPath path: String) -> Bool {
+        let fileManager = FileManager.default
+        guard let attrs = try? fileManager.attributesOfItem(atPath: path),
+              attrs[.type] as? FileAttributeType == .typeDirectory,
+              (attrs[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
+              let mode = attrs[.posixPermissions] as? Int,
+              mode & 0o077 != 0 else { return false }
+
+        // Keep the owner bits as they are and drop only group/other.
+        return (try? fileManager.setAttributes(
+            [.posixPermissions: mode & 0o700], ofItemAtPath: path)) != nil
     }
 
     /// Generate and install the sync script and launchd plist for a profile
@@ -240,6 +273,7 @@ final class SyncSetupService {
     /// paused profile stops firing scheduled syncs; resume calls `loadAgent`.
     @discardableResult
     func unloadAgent(for profile: SyncProfile) -> Bool {
+        noteDeliberateUnmount(for: profile)
         let result = runCommand("/bin/launchctl", arguments: ["unload", profile.plistPath])
         print("[SyncTray] launchctl unload exit code: \(result.exitCode), output: \(result.output)")
         return result.exitCode == 0
@@ -264,6 +298,7 @@ final class SyncSetupService {
         // straight to `launchctl unload` with no detach step at all and could freeze
         // an in-progress stream read for as long as the stale mount lingered.
         if profile.isMountMode {
+            noteDeliberateUnmount(for: profile)
             let detachStart = Date()
             let wasMounted = isMounted(profile: profile)
             var detachResult = "not_mounted"
@@ -410,6 +445,170 @@ final class SyncSetupService {
         ["bisync", remote, localPath,
          "--resync", "--resync-mode", "newer",
          "--verbose", "--use-json-log", "--stats", "2s"]
+    }
+
+    /// Splits a profile's `additionalRcloneFlags` into rclone arguments exactly as the sync
+    /// script's `split_additional_flags` does: Python's `shlex.split` (POSIX quoting, never
+    /// evaluated), then on each token `os.path.expandvars` followed by `os.path.expanduser`,
+    /// plus `expanduser` on the value of a `--flag=~/path` token. Returns `nil` where the
+    /// script refuses to run rclone: an unbalanced quote, or a trailing backslash.
+    ///
+    /// The auto-fix resync used to split on whitespace instead, so a quoted value
+    /// (`--exclude "some dir/**"`) or a `~` / `$VAR` path gave the resync different filters
+    /// than the scheduled run — the resync converged on one file set and the next bisync
+    /// found a file the resync never listed (#123). `ConfigSelfTest` AC-AF2 checks this
+    /// against the script's own splitter. Pure (environment and home lookups are injected).
+    static func splitAdditionalFlags(
+        _ flags: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        userHome: (String) -> String? = { FileManager.default.homeDirectory(forUser: $0)?.path }
+    ) -> [String]? {
+        guard let tokens = shlexSplit(flags) else { return nil }
+        func expandUser(_ path: String) -> String {
+            // posixpath.expanduser
+            guard path.hasPrefix("~") else { return path }
+            let afterTilde = path.index(after: path.startIndex)
+            let slash = path[afterTilde...].firstIndex(of: "/") ?? path.endIndex
+            let name = String(path[afterTilde..<slash])
+            let home: String
+            if name.isEmpty {
+                guard let envHome = environment["HOME"] ?? userHome(NSUserName()) else { return path }
+                home = envHome
+            } else {
+                guard let found = userHome(name) else { return path }
+                home = found
+            }
+            var trimmed = Substring(home)
+            while trimmed.hasSuffix("/") { trimmed = trimmed.dropLast() }
+            let result = String(trimmed) + String(path[slash...])
+            return result.isEmpty ? "/" : result
+        }
+        return tokens.map { token in
+            var tok = expandUser(expandVariables(token, environment: environment))
+            if let eq = tok.firstIndex(of: "=") {
+                let flag = tok[..<eq], value = tok[tok.index(after: eq)...]
+                if flag.hasPrefix("-"), value.hasPrefix("~") {
+                    tok = String(flag) + "=" + expandUser(String(value))
+                }
+            }
+            return tok
+        }
+    }
+
+    /// Python's `shlex.split(s)` (posix, whitespace-split, no comments), scalar for scalar.
+    /// `nil` where shlex raises: "No closing quotation" / "No escaped character".
+    private static func shlexSplit(_ s: String) -> [String]? {
+        let whitespace: Set<Unicode.Scalar> = [" ", "\t", "\r", "\n"]
+        var tokens: [String] = []
+        var token = String.UnicodeScalarView()
+        var quoted = false
+        // " ": between tokens. "a": in a word. "'" / "\"": in a quote.
+        var state: Unicode.Scalar = " "
+        var escaped = false          // the previous scalar was an active backslash
+        var escapeReturn: Unicode.Scalar = "a"
+        func finishToken() {
+            tokens.append(String(token))
+            token = String.UnicodeScalarView()
+            quoted = false
+        }
+        for c in s.unicodeScalars {
+            if escaped {
+                // Inside double quotes a backslash only escapes `"` and `\`; elsewhere it is kept.
+                if escapeReturn == "\"", c != "\\", c != "\"" { token.append("\\") }
+                token.append(c)
+                escaped = false
+                state = escapeReturn
+                continue
+            }
+            switch state {
+            case "'":
+                quoted = true
+                if c == "'" { state = "a" } else { token.append(c) }
+            case "\"":
+                quoted = true
+                if c == "\"" {
+                    state = "a"
+                } else if c == "\\" {
+                    escapeReturn = "\""
+                    escaped = true
+                } else {
+                    token.append(c)
+                }
+            case "a":
+                if whitespace.contains(c) {
+                    state = " "
+                    finishToken()
+                } else if c == "'" || c == "\"" {
+                    state = c
+                } else if c == "\\" {
+                    escapeReturn = "a"
+                    escaped = true
+                } else {
+                    token.append(c)
+                }
+            default:
+                if whitespace.contains(c) { continue }
+                if c == "'" || c == "\"" {
+                    state = c
+                } else if c == "\\" {
+                    escapeReturn = "a"
+                    escaped = true
+                } else {
+                    token.append(c)
+                    state = "a"
+                }
+            }
+        }
+        if escaped { return nil }                       // "No escaped character"
+        if state == "'" || state == "\"" { return nil }  // "No closing quotation"
+        if state == "a", !token.isEmpty || quoted { finishToken() }
+        return tokens
+    }
+
+    /// Python's `posixpath.expandvars`: `$name` (ASCII letters, digits, `_`) and `${…}` are
+    /// replaced from `environment`; an unset name, or an unclosed `${`, stays literal, and a
+    /// substituted value is not scanned again.
+    private static func expandVariables(_ s: String, environment: [String: String]) -> String {
+        guard s.unicodeScalars.contains("$") else { return s }
+        let lower: ClosedRange<Unicode.Scalar> = "a"..."z"
+        let upper: ClosedRange<Unicode.Scalar> = "A"..."Z"
+        let digits: ClosedRange<Unicode.Scalar> = "0"..."9"
+        func isWord(_ c: Unicode.Scalar) -> Bool {
+            lower.contains(c) || upper.contains(c) || digits.contains(c) || c == "_"
+        }
+        let scalars = Array(s.unicodeScalars)
+        var out = String.UnicodeScalarView()
+        var i = 0
+        while i < scalars.count {
+            guard scalars[i] == "$", i + 1 < scalars.count else {
+                out.append(scalars[i]); i += 1; continue
+            }
+            var j = i + 1
+            var name: String?
+            if isWord(scalars[j]) {
+                while j < scalars.count, isWord(scalars[j]) { j += 1 }
+                name = String(String.UnicodeScalarView(scalars[(i + 1)..<j]))
+            } else if scalars[j] == "{" {
+                guard let close = scalars[(j + 1)...].firstIndex(of: "}") else {
+                    // An unclosed `${` keeps the rest literal, as current CPython does
+                    // (`\$(\w+|\{[^}]*\}?)`). Pythons before that fix (macOS's own 3.9)
+                    // still expand a later `$name` here; no real flag value has this shape.
+                    out.append(contentsOf: scalars[i...])
+                    break
+                }
+                name = String(String.UnicodeScalarView(scalars[(j + 1)..<close]))
+                j = close + 1
+            }
+            if let name, let value = environment[name] {
+                out.append(contentsOf: value.unicodeScalars)
+            } else if name != nil {
+                out.append(contentsOf: scalars[i..<j])
+            } else {
+                out.append(scalars[i]); j = i + 1
+            }
+            i = j
+        }
+        return String(out)
     }
 
     /// rclone bisync's working directory on macOS (`os.UserCacheDir()/rclone/bisync`).
@@ -952,7 +1151,106 @@ enum SyncAbort {
     }
 }
 
+// MARK: - Lock state for telemetry ("Profile status")
+
+extension SyncRunLock {
+    /// A bounded description of one lock file's holder, for the `sync.lock_state` /
+    /// `sync.session_lock_state` attributes of the heartbeat's `Profile status` log:
+    /// - `none` — no lock file, or an empty one;
+    /// - `pending` — the legacy `"pending"` sentinel (the guard treats it as live);
+    /// - `unreadable` — content that is neither a PID nor rclone's lock JSON (or a PID ≤ 0);
+    /// - `stale` — a PID that is no longer running;
+    /// - `live_app` — the app's own PID, the launch-gap placeholder (D4);
+    /// - `live_verified` — a running PID that `identify` recognises as this profile's run;
+    /// - `live_unverified` — a running PID that is NOT recognisably this profile's run. This is
+    ///   the signature of a stale lock whose PID was reused: `isLive` (just `kill(pid, 0)`)
+    ///   calls it live and the single-run guard blocks every run, but nothing of the
+    ///   profile is actually running.
+    /// `identify` is only consulted for a live PID that isn't the app's. Pure.
+    static func lockState(
+        holder: Holder, appPID: Int32, isAlive: (Int32) -> Bool, identify: (Int32) -> Bool
+    ) -> String {
+        switch holder {
+        case .none: return "none"
+        case .pending: return "pending"
+        case .unreadable: return "unreadable"
+        case .pid(let pid):
+            // kill(0, 0) "succeeds" (it signals the process group), so a 0 or negative PID
+            // would otherwise read as alive.
+            guard pid > 0 else { return "unreadable" }
+            guard isAlive(pid) else { return "stale" }
+            if pid == appPID { return "live_app" }
+            return identify(pid) ? "live_verified" : "live_unverified"
+        }
+    }
+}
+
+extension SyncAbort {
+    /// Whether a running process is recognisably one of this profile's run processes — the
+    /// `identify` check behind `SyncRunLock.lockState`'s `live_verified`. Accepts:
+    /// - the sync script — `bash` (or the shared script's own file name, depending on how `ps`
+    ///   reports a `#!` script) whose command line names this profile's `configPath`;
+    /// - an rclone whose command line has this profile's `localSyncPath` (as stored or
+    ///   `~`-expanded, trailing slash ignored) as a whole ARGUMENT (`containsWholePath`) —
+    ///   not a sibling folder sharing its prefix (`/x/Pictures2`), not a folder inside it
+    ///   (another profile syncing `/x/Pictures/Holiday`), and not a path that merely starts
+    ///   with it (every SyncTray rclone carries `--filter-from ~/.config/synctray/profiles/…`,
+    ///   which would otherwise make a profile syncing the home folder match them all).
+    /// Unlike `isRunRoot` an rclone qualifies whatever its parent: telemetry only describes
+    /// the lock, it never signals anything, so a script run's rclone holding the session lock
+    /// must count too. `arguments` nil (the process is gone, or `ps` failed) never
+    /// qualifies. Pure.
+    static func isProfileProcess(
+        _ entry: ProcessEntry, arguments: String?, configPath: String, localSyncPath: String
+    ) -> Bool {
+        guard let arguments else { return false }
+        let executable = (entry.name as NSString).lastPathComponent
+        if isRclone(executable) {
+            let raw = trimmingTrailingSlashes(localSyncPath)
+            let expanded = trimmingTrailingSlashes((localSyncPath as NSString).expandingTildeInPath)
+            return containsWholePath(arguments, raw) || containsWholePath(arguments, expanded)
+        }
+        let scriptName = (SyncProfile.sharedScriptPath as NSString).lastPathComponent
+        guard executable == "bash" || executable == scriptName else { return false }
+        return !configPath.isEmpty && arguments.contains(configPath)
+    }
+
+    /// Whether `path` (or `path/`) is one whole argument of `arguments`, the space-joined
+    /// command line `ps -o args=` prints: delimited by spaces or the ends of the line, so a
+    /// longer path that starts with it — a sibling (`/x/Sync2`), a folder inside it
+    /// (`/x/Sync/Photos`), a file under it (`--filter-from /x/.config/…`) — never matches.
+    /// `ps` doesn't quote arguments, so a folder name containing a space could still match
+    /// a longer name that continues after that space; telemetry accepts that ambiguity. Pure.
+    private static func containsWholePath(_ arguments: String, _ path: String) -> Bool {
+        guard !path.isEmpty else { return false }
+        let padded = " " + arguments + " "
+        return padded.contains(" \(path) ") || padded.contains(" \(path)/ ")
+    }
+
+    private static func trimmingTrailingSlashes(_ path: String) -> String {
+        var result = path
+        while result.count > 1 && result.hasSuffix("/") { result.removeLast() }
+        return result
+    }
+}
+
 extension SyncSetupService {
+    /// Record that SyncTray is about to detach this Stream profile's volume or unload its
+    /// agent on purpose, so the mount-interruption telemetry doesn't count the disappearance
+    /// as a drop (`MountDropClassifier`). Called by every detach path here, which the app and
+    /// the CLI share. Only the marker's modification time matters; the atomic write replaces
+    /// the file rather than writing through it. Best effort: a failed write can only make one
+    /// deliberate unmount look like a drop.
+    func noteDeliberateUnmount(for profile: SyncProfile) {
+        guard profile.isMountMode else { return }
+        try? Data().write(to: URL(fileURLWithPath: profile.deliberateUnmountMarkerPath), options: .atomic)
+    }
+
+    /// When `noteDeliberateUnmount` last ran for this profile, or nil if never (this boot).
+    func lastDeliberateUnmount(for profile: SyncProfile) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: profile.deliberateUnmountMarkerPath))?[.modificationDate] as? Date
+    }
+
     /// Update just the profile config (without reinstalling the script)
     func updateConfig(for profile: SyncProfile) throws {
         let config = generateProfileConfig(for: profile)
@@ -993,6 +1291,7 @@ extension SyncSetupService {
         guard profile.isMountMode else {
             throw SetupError.notMountMode
         }
+        noteDeliberateUnmount(for: profile)
 
         // Detach the volume if it's currently mounted (graceful, then force).
         if isMounted(profile: profile) {
@@ -1054,6 +1353,7 @@ extension SyncSetupService {
 
             // Leave a HEALTHY live mount alone; only clear a genuine orphan (job dead).
             if isMountAgentRunning(profile: profile) { continue }
+            noteDeliberateUnmount(for: profile)
             _ = runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", mountPoint])
         }
     }
@@ -2623,16 +2923,19 @@ extension SyncSetupService {
             try fm.createDirectory(atPath: binDir, withIntermediateDirectories: true)
         }
 
-        // Create ~/.local/log if needed
+        // Create ~/.local/log if needed — owner-only: the logs name every synced file
         let logDir = (profile.logPath as NSString).deletingLastPathComponent
         if !fm.fileExists(atPath: logDir) {
-            try fm.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+            try fm.createDirectory(
+                atPath: logDir, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
         }
 
-        // Create ~/.config/synctray/profiles if needed
+        // Create ~/.config/synctray/profiles if needed — owner-only, like the logs
         if !fm.fileExists(atPath: SyncProfile.configDirectory) {
             try fm.createDirectory(
-                atPath: SyncProfile.configDirectory, withIntermediateDirectories: true)
+                atPath: SyncProfile.configDirectory, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
         }
 
         // LaunchAgents directory should already exist, but just in case
@@ -2801,6 +3104,176 @@ enum SyncExcludeFilter {
     /// decided about.
     static let includeBeginMarker = "# >>> SyncTray \"Sync Only These Folders\" (managed: edit them in SyncTray's profile settings)"
     static let includeEndMarker = "# <<< SyncTray \"Sync Only These Folders\""
+
+    /// A default "never sync this" rule for a macOS package/library that privacy controls won't
+    /// let other apps read — written into every new filter file as part of
+    /// `SyncSetupService.defaultExcludeFilter`, and added once to existing filters by a
+    /// `ProfileMigration` built on `DefaultExcludeMigration.apply(_:in:hasEntry:logTag:)`. It is
+    /// ordinary user content, not a managed block: the user can delete the line to sync a
+    /// library they have granted Full Disk Access to.
+    ///
+    /// `.photosLibrary` and `.photoBoothLibrary` are the two instances today (migrations v5 and v8); a
+    /// future TCC-blocked default follows the same shape.
+    struct DefaultExclude {
+        /// The raw `- …` rclone rule line.
+        let rule: String
+        /// `rule` plus its explanatory comment, as written into the default filter.
+        let section: String
+        /// Case-insensitive substring that means "this filter already mentions this library" —
+        /// either because the default is already there, or because the user wrote their own
+        /// rule for it, which is theirs to keep. Checked against `existing.lowercased()`.
+        let mentionToken: String
+        /// Whether a filesystem entry (as walked by `DefaultExcludeMigration.containsEntry`) IS
+        /// this kind of library. Must be checked before any package-content skip, since a
+        /// `.photoslibrary` and `Photo Booth Library` are themselves packages.
+        let matchesEntry: (URL) -> Bool
+
+        /// A `.photoslibrary` is a live database package that macOS privacy controls won't let
+        /// other apps read, so syncing a folder that holds one (typically `~/Pictures`) failed
+        /// every run with "operation not permitted" — and rclone then also refused to propagate
+        /// any deletion ("not deleting files as there were IO errors"). Copying it file by file
+        /// while Photos has it open can produce an inconsistent copy anyway.
+        static let photosLibrary = DefaultExclude(
+            rule: "- *.photoslibrary/**",
+            section: """
+                # Apple Photos libraries: a live database macOS doesn't let other apps read
+                - *.photoslibrary/**
+                """,
+            mentionToken: ".photoslibrary",
+            matchesEntry: { $0.pathExtension.lowercased() == "photoslibrary" }
+        )
+
+        /// `Photo Booth Library` is a macOS package with no file extension (unlike
+        /// `.photoslibrary`), so it needs a name match rather than an extension glob. Same TCC
+        /// denial shape: `open … Photo Booth Library: operation not permitted` on every run.
+        static let photoBoothLibrary = DefaultExclude(
+            rule: "- Photo Booth Library/**",
+            section: """
+                # Apple Photo Booth library: macOS doesn't let other apps read it
+                - Photo Booth Library/**
+                """,
+            mentionToken: "photo booth library",
+            matchesEntry: { $0.lastPathComponent.caseInsensitiveCompare("Photo Booth Library") == .orderedSame }
+        )
+    }
+
+    /// Back-compat wrapper — see `DefaultExclude.photosLibrary`.
+    static let photosLibraryRule = DefaultExclude.photosLibrary.rule
+    /// Back-compat wrapper — see `DefaultExclude.photosLibrary`.
+    static let photosLibrarySection = DefaultExclude.photosLibrary.section
+
+    /// `existing` with `def.section` added at the top of the user's own rules — right below the
+    /// managed "Don't Sync" head block and above any hand-written `+` include, since rclone
+    /// applies the first rule that matches. Returns nil when nothing should change: the file
+    /// already mentions `def.mentionToken` (the default is already there, or the user wrote
+    /// their own rule for it, which is theirs to keep).
+    static func addingDefault(_ def: DefaultExclude, to existing: String) -> String? {
+        guard !existing.lowercased().contains(def.mentionToken) else { return nil }
+        return insertingDefaultSection(def.section, into: existing)
+    }
+
+    /// The folders macOS creates at the root of every volume it mounts (an external drive, a
+    /// disk image): the Spotlight index, the FSEvents log, the per-volume Trash, document
+    /// versions and temporary items. They are owned by root and most are unreadable to the
+    /// user, so when a Two-Way or One-Way profile's local folder is a volume root and nothing
+    /// else keeps rclone out of them, listing them fails with "permission denied" — every
+    /// run exits non-zero and rclone stops propagating deletions. Before this default, only
+    /// the "Sync Only These Folders" tail block's trailing `- **` kept them out, so removing
+    /// the last include folder broke such a profile. They never hold user data.
+    static let volumeSystemFolderNames = [
+        ".fseventsd", ".Spotlight-V100", ".Trashes", ".DocumentRevisions-V100", ".TemporaryItems",
+    ]
+
+    /// One rule per folder. Each ends in `/**`, which makes it an rclone DIRECTORY rule, so
+    /// rclone never opens the folder at all. A bare name (the old default `- .fseventsd`) is a
+    /// file-only rule in rclone (`fs/filter/filter.go` `Filter.Add`): it matches a file of
+    /// that name and still lets rclone descend into — and fail to list — the folder.
+    /// Unanchored, so a nested volume root (a mounted image inside the folder) is covered too.
+    static let volumeSystemFolderRules = volumeSystemFolderNames.map { "- \($0)/**" }
+
+    /// Written into every new filter file as part of `SyncSetupService.defaultExcludeFilter`,
+    /// and added once to existing ones by `MigrationV6VolumeSystemFoldersExclude`
+    /// (`addingVolumeSystemFolderDefaults(to:)`). Ordinary user content, like the Photos rule.
+    static let volumeSystemFoldersSection = (
+        ["# macOS volume system folders: root-owned, unreadable, never user data"] + volumeSystemFolderRules
+    ).joined(separator: "\n")
+
+    /// `existing` with `volumeSystemFoldersSection` added where `addingPhotosLibraryDefault`
+    /// puts its rule (below the managed "Don't Sync" block, above the user's own rules). Nil
+    /// when every rule is already present as written, so a second pass changes nothing; a
+    /// user's own rule for one of the folders is left alone (a duplicate rule is harmless).
+    static func addingVolumeSystemFolderDefaults(to existing: String) -> String? {
+        let lines = Set(existing.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) })
+        guard !volumeSystemFolderRules.allSatisfy({ lines.contains($0) }) else { return nil }
+        return insertingDefaultSection(volumeSystemFoldersSection, into: existing)
+    }
+
+    /// `existing` with `section` inserted at the top of the user's own rules — right below the
+    /// managed "Don't Sync" head block and above any hand-written `+` include, since rclone
+    /// applies the first rule that matches. The head block is re-emitted exactly as found, so a
+    /// later `merged(existing:patterns:)` with the same patterns returns this output unchanged.
+    private static func insertingDefaultSection(_ section: String, into existing: String) -> String {
+        var headBlock = ""
+        let lines = existing.components(separatedBy: "\n")
+        if let start = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == beginMarker }) {
+            // Same block bounds `strippingManagedBlock` uses: up to the end marker, or — when
+            // the end marker was deleted by hand — up to the first blank line.
+            let end = lines[start...].firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == endMarker })
+                ?? lines[start...].firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }).map { $0 - 1 }
+                ?? lines.count - 1
+            headBlock = lines[start...end].joined(separator: "\n")
+        }
+
+        let userContent = droppingLeadingBlankLines(strippingManagedBlock(from: existing))
+        var output = headBlock.isEmpty ? "" : headBlock + "\n\n"
+        output += section
+        if userContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return output + "\n"
+        }
+        return output + "\n\n" + userContent
+    }
+
+    /// Back-compat wrapper — see `addingDefault(_:to:)` with `.photosLibrary`.
+    static func addingPhotosLibraryDefault(to existing: String) -> String? {
+        addingDefault(.photosLibrary, to: existing)
+    }
+
+    /// The "Don't Sync" pattern that excludes exactly `blockedPath` — a local path rclone
+    /// reported it couldn't read (`SyncLogPatterns.blockedAccessPath`) —
+    /// from a profile synced at `localSyncPath`: anchored to the sync folder's root with a
+    /// leading `/`, and, for a folder, ending in `/` ("this folder and everything in it").
+    /// nil when the path is the sync folder itself or isn't inside it (neither can be
+    /// excluded by a pattern), or would corrupt the filter file.
+    ///
+    /// Note: a `*` or `?` in the folder's own name is still a wildcard in SyncTray's pattern
+    /// syntax, so such a pattern can match a little more than the one folder.
+    static func excludePattern(forBlockedPath blockedPath: String, localSyncPath: String, isDirectory: Bool) -> String? {
+        guard let relative = relativePath(of: blockedPath, within: localSyncPath),
+              !relative.isEmpty, !relative.contains(where: { $0.isNewline }) else { return nil }
+        return "/" + relative + (isDirectory ? "/" : "")
+    }
+
+    /// Whether `path` is the sync folder `localSyncPath` itself or inside it — what makes an
+    /// "operation not permitted" error a LOCAL (macOS privacy) denial rather than a remote
+    /// server's EPERM.
+    static func isWithinSyncFolder(_ path: String, localSyncPath: String) -> Bool {
+        relativePath(of: path, within: localSyncPath) != nil
+    }
+
+    /// `path` relative to `root` (`""` for the root itself), or nil when it isn't inside it.
+    /// Both are tilde-expanded and standardized first.
+    private static func relativePath(of path: String, within root: String) -> String? {
+        func normalized(_ value: String) -> String {
+            ((value as NSString).expandingTildeInPath as NSString).standardizingPath
+        }
+        let base = normalized(root)
+        let target = normalized(path)
+        guard !base.isEmpty, !target.isEmpty else { return nil }
+        if target == base { return "" }
+        let prefix = base.hasSuffix("/") ? base : base + "/"
+        guard target.hasPrefix(prefix) else { return nil }
+        return String(target.dropFirst(prefix.count))
+    }
 
     /// The rclone globs (without the `- ` prefix) that exclude exactly the files `pattern`
     /// matches under SyncTray's matcher. Empty for a blank pattern, or one containing a line

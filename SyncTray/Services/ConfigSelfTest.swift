@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import OpenTelemetryApi
 
 #if DEBUG
 
@@ -59,6 +61,8 @@ enum ConfigSelfTest {
             testListingWarmOnMount,
             testListingWarmDescentPrimitives,
             testSpotlightMarkerWrite,
+            testMountStallProbe,
+            testMountDropClassifier,
             testMountPollDecision,
             testLegacyOfflineLinkCleanup,
             testWarmReconcileTrigger,
@@ -108,6 +112,7 @@ enum ConfigSelfTest {
             testMountModeParse,
             testWarmMenuBarSummary,
             testWarmAutoPauseReaders,
+            testWarmPauseReaderTelemetry,
             testMountModeTransitionText,
             testMountNoFallbackOverride,
             testCacheSuffixConsolidation,
@@ -119,9 +124,14 @@ enum ConfigSelfTest {
             testRCAPIAuthenticated,
             testShimQuotesExecutablePath,
             testMountModeFileNotInSharedTmp,
+            testLogAndProfileDirsOwnerOnly,
             testRemoteFolderListingKeepsSpaces,
             testCLIRemoteFolders,
             testCLITelemetryConsent,
+            testAppSettingsCLIAndFile,
+            testDoctorLockLiveness,
+            testRemoteProbePathScopedAndSummarized,
+            testCLITelemetryFlushWaitsForSend,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -148,6 +158,32 @@ enum ConfigSelfTest {
             testSyncRunLockReleaseAndReplace,
             testSyncRunLockSessionNameAndParse,
             testPriorLockFileRejectedRun,
+            testNFSExclusiveCreateNoticeNotAnError,
+            testPhotosLibraryDefaultExclude,
+            testMigrationV5PhotosLibraryExclude,
+            testMacOSBlockedAccessPatterns,
+            testMacOSBlockedAccessWiringPinned,
+            testPhotoBoothLibraryDefaultExclude,
+            testMigrationV8PhotoBoothLibraryExclude,
+            testFilterSaveFollowUpMatrix,
+            testStagedDontSyncSourcePins,
+            testStopThenSyncWiringPinned,
+            testVolumeSystemFolderDefaultExclude,
+            testMigrationV6VolumeSystemFolders,
+            testMigrationV7VolumeSystemFolderResync,
+            testVolumeSystemFoldersRealRclone,
+            testPermissionDeniedBlockedAccess,
+            testTelemetryLockState,
+            testTelemetryErrorCategories,
+            testSyncPathKind,
+            testRemoteBackendType,
+            testSyncProgressAttributes,
+            testSyncFailureCountedOnce,
+            testSyncFailureHandledOnce,
+            testAutoFixRecurringResync,
+            testAdditionalFlagsSplitParity,
+            testMutedRepeatedFailureNotified,
+            testTelemetryOptInRecordsSnapshot,
             testRunLivenessMountMode,
             testExclusiveRunRegistryStaleGrace,
             testSyncRunLockAcquire,
@@ -163,6 +199,16 @@ enum ConfigSelfTest {
             testAbortEscalation,
             testAbortRunEndSuppression,
             testAbortWiringPinned,
+            testRcloneErrorLinesNotFileChanges,
+            testDiagnosticReportCode,
+            testDiagnosticRedaction,
+            testDiagnosticReportBuilder,
+            testDiagnosticOTLPEncoding,
+            testCLIReportParsing,
+            testCLIReportExecute,
+            testReportSheetCancelStopsSend,
+            testMenuBarIconAppearance,
+            testMenuBarIconRendering,
         ]
 
         for check in checks {
@@ -181,6 +227,24 @@ enum ConfigSelfTest {
             print("\(id) \(slug): FAIL \(detail)")
         }
         return passed
+    }
+
+    /// Runs `/usr/bin/chflags <flag> <path>` and waits for it to exit. Used to isolate a single
+    /// fixture FILE's writability (`uchg` blocks a rename-over-target write without needing the
+    /// containing directory to be read-only, which would also block sibling writes) — see
+    /// AC-PL6's filter-write-fails case.
+    private static func runChflags(_ flag: String, _ path: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/chflags")
+        proc.arguments = [flag, path]
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            // Best-effort — the caller's own assertions will fail loudly if this didn't work.
+        }
     }
 
     private static func sampleProfile(
@@ -1353,6 +1417,111 @@ enum ConfigSelfTest {
         return report("AC-LW2", "listing-warm-descent", true)
     }
 
+    // MARK: - AC-MI1 — mount stall probe state machine
+
+    /// `MountStallProbe` (mount-interruption telemetry): one outstanding probe at a time,
+    /// probes spaced by `probeInterval`, a stall reported exactly once when a probe has been
+    /// outstanding for `stallThreshold`, closed with its duration when the probe returns,
+    /// and closed (then silenced) when the volume goes away mid-stall.
+    private static func testMountStallProbe() -> Bool {
+        let id = "AC-MI1", slug = "mount-stall-probe"
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        var probe = MountStallProbe()
+
+        guard probe.shouldStartProbe(now: t0) else {
+            return report(id, slug, false, "(a fresh probe state did not want to start a probe)")
+        }
+        probe.probeStarted(at: t0)
+        guard !probe.shouldStartProbe(now: t0.addingTimeInterval(60)) else {
+            return report(id, slug, false, "(a second probe was allowed while one is outstanding)")
+        }
+        guard probe.evaluate(now: t0.addingTimeInterval(MountStallProbe.stallThreshold - 1)) == .none else {
+            return report(id, slug, false, "(a stall was reported before the threshold)")
+        }
+        guard probe.evaluate(now: t0.addingTimeInterval(MountStallProbe.stallThreshold)) == .stallStarted(since: t0) else {
+            return report(id, slug, false, "(no stall reported at the threshold)")
+        }
+        guard probe.evaluate(now: t0.addingTimeInterval(40)) == .none else {
+            return report(id, slug, false, "(the same stall was reported twice)")
+        }
+        let back = t0.addingTimeInterval(42)
+        guard probe.probeFinished(at: back) == .stallEnded(duration: 42) else {
+            return report(id, slug, false, "(the probe returning did not close the stall with its duration)")
+        }
+        guard !probe.shouldStartProbe(now: back.addingTimeInterval(MountStallProbe.probeInterval - 1)),
+              probe.shouldStartProbe(now: back.addingTimeInterval(MountStallProbe.probeInterval)) else {
+            return report(id, slug, false, "(probes were not spaced by probeInterval)")
+        }
+
+        // A quick probe never reports anything.
+        let t1 = back.addingTimeInterval(MountStallProbe.probeInterval)
+        probe.probeStarted(at: t1)
+        guard probe.probeFinished(at: t1.addingTimeInterval(0.2)) == .none else {
+            return report(id, slug, false, "(a probe that returned in time reported a stall end)")
+        }
+
+        // Volume goes away mid-stall: closed once, and the late return stays silent.
+        let t2 = t1.addingTimeInterval(MountStallProbe.probeInterval + 1)
+        probe.probeStarted(at: t2)
+        _ = probe.evaluate(now: t2.addingTimeInterval(MountStallProbe.stallThreshold))
+        guard probe.volumeWentAway(at: t2.addingTimeInterval(20)) == .stallEnded(duration: 20) else {
+            return report(id, slug, false, "(the volume going away did not close the open stall)")
+        }
+        guard probe.evaluate(now: t2.addingTimeInterval(60)) == .none,
+              probe.probeFinished(at: t2.addingTimeInterval(61)) == .none else {
+            return report(id, slug, false, "(a stall closed by the volume going away was reported again)")
+        }
+
+        // Volume goes away with a probe outstanding but no stall yet: that probe stays silent.
+        let t3 = t2.addingTimeInterval(200)
+        probe.probeStarted(at: t3)
+        guard probe.volumeWentAway(at: t3.addingTimeInterval(1)) == .none,
+              probe.evaluate(now: t3.addingTimeInterval(MountStallProbe.stallThreshold + 5)) == .none else {
+            return report(id, slug, false, "(a probe outstanding when the volume went away later reported a stall)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-MI2 — mount drop classification
+
+    /// `MountDropClassifier`: a disappearance is a drop only when the agent is still loaded,
+    /// the profile is an enabled, unpaused Stream profile, and no deliberate-unmount marker
+    /// explains it (written up to `deliberateWindow` before the disappearance). Also checks
+    /// that the marker lives in the per-user temp dir, never the shared /tmp.
+    private static func testMountDropClassifier() -> Bool {
+        let id = "AC-MI2", slug = "mount-drop-classifier"
+        let seen = Date(timeIntervalSince1970: 2_000_000)
+        func drop(_ loaded: Bool, _ enabled: Bool, _ paused: Bool, _ marker: Date?) -> Bool {
+            MountDropClassifier.isUnexpectedDrop(
+                agentLoaded: loaded, isEnabledMountProfile: enabled, isPaused: paused,
+                lastDeliberateUnmount: marker, disappearedAt: seen)
+        }
+        guard drop(true, true, false, nil) else {
+            return report(id, slug, false, "(a volume gone under a loaded agent with no marker was not a drop)")
+        }
+        guard !drop(false, true, false, nil) else {
+            return report(id, slug, false, "(an unloaded agent was counted as a drop)")
+        }
+        guard !drop(true, false, false, nil), !drop(true, true, true, nil) else {
+            return report(id, slug, false, "(a disabled or paused profile was counted as a drop)")
+        }
+        guard !drop(true, true, false, seen.addingTimeInterval(-3)),
+              !drop(true, true, false, seen.addingTimeInterval(-MountDropClassifier.deliberateWindow)) else {
+            return report(id, slug, false, "(a fresh deliberate-unmount marker did not rule out a drop, e.g. a reinstall)")
+        }
+        guard drop(true, true, false, seen.addingTimeInterval(-MountDropClassifier.deliberateWindow - 1)) else {
+            return report(id, slug, false, "(a stale deliberate-unmount marker still ruled out a drop)")
+        }
+        guard drop(true, true, false, seen.addingTimeInterval(30)) else {
+            return report(id, slug, false, "(a marker written well after the disappearance ruled out the drop)")
+        }
+        let marker = sampleProfile().deliberateUnmountMarkerPath
+        guard marker.hasPrefix(SyncProfile.privateTempDirectory), !marker.hasPrefix("/tmp/") else {
+            return report(id, slug, false, "(the deliberate-unmount marker is not in the per-user temp dir: \(marker))")
+        }
+        return report(id, slug, true)
+    }
+
     // MARK: - AC-SM1 — Spotlight-exclusion marker write on mount
 
     /// The `.metadata_never_index` marker stops macOS bulk-indexing a freshly-mounted network
@@ -1698,6 +1867,7 @@ enum ConfigSelfTest {
         unmountProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
+        processIsAlive: @escaping (Int32) -> Bool = { _ in false },
         probeMount: @escaping (SyncProfile) -> MountProbe = { _ in
             MountProbe(mounted: false, processRunning: false, pendingUploads: 0)
         },
@@ -1736,6 +1906,7 @@ enum ConfigSelfTest {
             migrateCache: migrateCache,
             readStdin: readStdin,
             readFile: readFile,
+            processIsAlive: processIsAlive,
             probeMount: probeMount,
             warmEstimate: warmEstimate,
             remoteSkipsCertCheck: remoteSkipsCertCheck,
@@ -3141,6 +3312,48 @@ enum ConfigSelfTest {
         return report("AC-WV2", "warm-auto-pause", true)
     }
 
+    // MARK: - AC-WV3 — an auto-pause reports which process took the link, bounded
+
+    /// The auto-pause hands its readers to telemetry (`SyncManager.warmPauseReaders`), and the
+    /// log attribute stays bounded and privacy-safe (`TelemetryService.warmPauseReaderSummary`):
+    /// allowlisted macOS components by name, shells as `shell`, every other app as `app`,
+    /// distinct, sorted, capped.
+    private static func testWarmPauseReaderTelemetry() -> Bool {
+        let id = "AC-WV3", slug = "warm-pause-reader-telemetry"
+        let lsof = "p1\ncFinder\np2\ncSyncTray\np3\ncQuickLookSatellite\np4\ncREAPER\np5\nczsh\np6\ncREAPER\n"
+        guard SyncManager.warmPauseReaders(lsofOutput: lsof) == ["QuickLookSatellite", "REAPER", "zsh"] else {
+            return report(id, slug, false, "(warmPauseReaders did not keep exactly the interactive readers)")
+        }
+        guard SyncManager.warmPauseReaders(lsofOutput: nil).isEmpty,
+              SyncManager.warmPauseReaders(lsofOutput: "p1\ncSyncTray\n").isEmpty else {
+            return report(id, slug, false, "(a failed lsof or the warmer alone produced readers)")
+        }
+        guard SyncManager.shouldAutoPauseWarm(lsofOutput: lsof),
+              !SyncManager.shouldAutoPauseWarm(lsofOutput: nil) else {
+            return report(id, slug, false, "(shouldAutoPauseWarm no longer agrees with warmPauseReaders)")
+        }
+        guard TelemetryService.warmPauseReaderLabel("QuickLookSatellite") == "QuickLookSatellite",
+              TelemetryService.warmPauseReaderLabel("SyncTrayFinderSync") == "SyncTrayFinderSync",
+              TelemetryService.warmPauseReaderLabel("com.apple.quicklook.ThumbnailsA")
+                  == "com.apple.quicklook.ThumbnailsAgent",
+              TelemetryService.warmPauseReaderLabel("-zsh") == "shell",
+              TelemetryService.warmPauseReaderLabel("REAPER") == "app",
+              TelemetryService.warmPauseReaderLabel("Johns Private Tool") == "app" else {
+            return report(id, slug, false, "(a reader was not mapped to its bounded label)")
+        }
+        let summaryInput = ["zsh", "REAPER", "QuickLookSatellite", "REAPER"]
+        guard TelemetryService.warmPauseReaderSummary(summaryInput) == "QuickLookSatellite,app,shell" else {
+            return report(id, slug, false,
+                          "(summary not distinct+sorted: \(TelemetryService.warmPauseReaderSummary(summaryInput)))")
+        }
+        let many = ["QuickLookSatellite", "iconservicesagent", "revisiond", "bird", "cloudd", "backupd", "zsh", "X"]
+        guard TelemetryService.warmPauseReaderSummary(many).split(separator: ",").count
+                == TelemetryService.warmPauseReaderSummaryLimit else {
+            return report(id, slug, false, "(summary was not capped at warmPauseReaderSummaryLimit)")
+        }
+        return report(id, slug, true)
+    }
+
     // MARK: - AC-MT1 — Cache Only ↔ Streaming switch shows a direction-aware transition
 
     private static func testMountModeTransitionText() -> Bool {
@@ -3777,6 +3990,248 @@ enum ConfigSelfTest {
         return report(name, slug, true)
     }
 
+    // MARK: - AC-CLI14 — the CLI waits for its telemetry to be sent before exiting
+
+    /// opentelemetry-swift 1.17.1 OTLP/HTTP exporters return from `export` before the
+    /// request completes, so a CLI that exits right after `forceFlush()` sends nothing.
+    /// `waitUntilIdle` must keep polling while requests are in flight and give up at the
+    /// deadline; every exporter must send on the session `flushForExit` watches, and
+    /// `flushForExit` must actually wait on it.
+    private static func testCLITelemetryFlushWaitsForSend() -> Bool {
+        let name = "AC-CLI14", slug = "cli-telemetry-flush-waits"
+
+        // Drains: 2 in flight, then 1, then 0 → true after two sleeps.
+        var pending = [2, 1, 0]
+        var sleeps = 0
+        let drained = TelemetryService.waitUntilIdle(
+            deadline: .now() + 60,
+            inFlight: { pending.isEmpty ? 0 : pending.removeFirst() },
+            sleep: { _ in sleeps += 1 })
+        guard drained, sleeps == 2 else {
+            return report(name, slug, false, "(did not wait for in-flight requests: drained=\(drained) sleeps=\(sleeps))")
+        }
+
+        // Never drains: stops at the deadline instead of hanging the CLI.
+        let start = DispatchTime.now()
+        var ticks: UInt64 = 0
+        let gaveUp = !TelemetryService.waitUntilIdle(
+            deadline: start + .seconds(1),
+            inFlight: { 1 },
+            now: { ticks += 1; return start + .milliseconds(Int(ticks) * 300) },
+            sleep: { _ in })
+        guard gaveUp, ticks <= 5 else {
+            return report(name, slug, false, "(did not stop at the deadline: ticks=\(ticks))")
+        }
+
+        guard let source = readSourceFile("Services/TelemetryService.swift") else {
+            return report(name, slug, false, "(could not read TelemetryService.swift)")
+        }
+        let exporterSessions = source.components(separatedBy: "useSession: Self.exportSession").count - 1
+        let flush = extractFunctionBody(startingAt: "func flushForExit(", in: source) ?? ""
+        let quit = extractFunctionBody(startingAt: "func shutdown(", in: source) ?? ""
+        guard exporterSessions == 3, flush.contains("waitUntilIdle("), quit.contains("waitUntilIdle(") else {
+            return report(name, slug, false, "(exporters on the watched session: \(exporterSessions)/3; flushForExit waits: \(flush.contains("waitUntilIdle(")); shutdown waits: \(quit.contains("waitUntilIdle(")))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-ST1 — every app-wide setting is file- and CLI-controllable
+
+    /// Every app-wide setting must be readable and writable through `settings.json`
+    /// and `synctray settings`: the schema lists exactly the store's keys; string
+    /// values are validated and normalized; an invalid file value is ignored, never
+    /// applied; `settings set` validates every pair before writing any; and launch
+    /// applies the file before rewriting it, so an edit made while the app was
+    /// closed isn't discarded.
+    private static func testAppSettingsCLIAndFile() -> Bool {
+        let name = "AC-ST1", slug = "app-settings-cli-and-file"
+
+        guard let schemaText = readSourceFile("Resources/Schemas/settings.schema.json"),
+              let schema = (try? JSONSerialization.jsonObject(with: Data(schemaText.utf8))) as? [String: Any],
+              let properties = schema["properties"] as? [String: Any],
+              Set(properties.keys).subtracting(["$schema"]) == Set(AppSettingsFileStore.allKeyNames) else {
+            return report(name, slug, false, "(settings.schema.json properties differ from AppSettingsFileStore keys)")
+        }
+
+        typealias Key = AppSettingsFileStore.StringKey
+        let cases: [(Key, String, String?)] = [
+            (.menuBarIconStyle, "Monochrome", "monochrome"),
+            (.menuBarIconStyle, " custom ", "custom"),
+            (.menuBarIconStyle, "neon", nil),
+            (.menuBarIconStyle, "", nil),
+            (.menuBarIconSyncingColor, "ff8800", "#FF8800"),
+            (.menuBarIconSyncingColor, "#00aaFF", "#00AAFF"),
+            (.menuBarIconIdleColor, "", ""),
+            (.menuBarIconIdleColor, "#12345", nil),
+            (.menuBarIconIdleColor, "blue", nil),
+        ]
+        for (key, raw, expected) in cases where key.normalize(raw) != expected {
+            return report(name, slug, false, "(\(key.rawValue) normalize(\(raw.debugDescription)) = \(key.normalize(raw).debugDescription), want \(expected.debugDescription))")
+        }
+
+        let suiteName = "synctray.selftest.appsettings"
+        guard let suite = UserDefaults(suiteName: suiteName) else {
+            return report(name, slug, false, "(couldn't create a UserDefaults suite)")
+        }
+        suite.removePersistentDomain(forName: suiteName)
+        suite.set("bogus", forKey: Key.menuBarIconStyle.rawValue)
+        suite.set("#abcdef", forKey: Key.menuBarIconIdleColor.rawValue)
+        let current = AppSettingsFileStore.currentStringSettings(defaults: suite)
+        suite.removePersistentDomain(forName: suiteName)
+        guard current == [.menuBarIconStyle: "color", .menuBarIconSyncingColor: "", .menuBarIconIdleColor: "#ABCDEF"] else {
+            return report(name, slug, false, "(currentStringSettings didn't fall back / normalize: \(current))")
+        }
+
+        let dir = "\(selfTestRoot)/app-settings"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = "\(dir)/settings.json"
+        let seed = #"{"debugLoggingEnabled":true,"launchAtLogin":true,"menuBarIconStyle":"neon","menuBarIconIdleColor":"00ff00","menuBarIconSyncingColor":7}"#
+        FileManager.default.createFile(atPath: path, contents: Data(seed.utf8))
+        guard AppSettingsFileStore.readStringSettings(at: path) == [.menuBarIconIdleColor: "#00FF00"] else {
+            return report(name, slug, false, "(readStringSettings applied an invalid value: \(AppSettingsFileStore.readStringSettings(at: path)))")
+        }
+        guard AppSettingsFileStore.updateSettingsFile(
+                values: ["menuBarIconStyle": "custom", "autoFixSyncIssues": false], isLoginItemEnabled: false, directory: dir),
+              let written = FileManager.default.contents(atPath: path),
+              let json = (try? JSONSerialization.jsonObject(with: written)) as? [String: Any],
+              json["menuBarIconStyle"] as? String == "custom", json["autoFixSyncIssues"] as? Bool == false,
+              json["launchAtLogin"] as? Bool == true, json["debugLoggingEnabled"] as? Bool == true,
+              json["menuBarIconIdleColor"] as? String == "00ff00" else {
+            return report(name, slug, false, "(updateSettingsFile(values:) didn't keep the other keys)")
+        }
+
+        guard case .success(.settings(.show(json: false))) = SyncTrayCLI.parse(["settings"]),
+              case .success(.settings(.show(json: true))) = SyncTrayCLI.parse(["settings", "--json"]),
+              case .success(.settings(.show(json: true))) = SyncTrayCLI.parse(["settings", "show", "--json"]),
+              case .success(.settings(.get(key: "menuBarIconStyle"))) = SyncTrayCLI.parse(["settings", "get", "menuBarIconStyle"]),
+              case .success(.settings(.set(let pairs))) = SyncTrayCLI.parse(["settings", "set", "menuBarIconIdleColor", "", "debugLoggingEnabled", "on"]),
+              pairs == [ProfileAssignment(key: "menuBarIconIdleColor", value: ""), ProfileAssignment(key: "debugLoggingEnabled", value: "on")],
+              case .failure = SyncTrayCLI.parse(["settings", "set", "menuBarIconStyle"]),
+              case .failure = SyncTrayCLI.parse(["settings", "get"]),
+              case .failure = SyncTrayCLI.parse(["settings", "frob"]),
+              SyncTrayCLI.telemetryVerb(for: ["settings"]) == "settings-show",
+              SyncTrayCLI.telemetryVerb(for: ["settings", "set", "x", "y"]) == "settings-set",
+              SyncTrayCLI.telemetryVerb(for: ["settings", "frob"]) == "(other)" else {
+            return report(name, slug, false, "(settings parse or telemetry verb wrong)")
+        }
+
+        var writes: [[String: AppSettingValue]] = []
+        var out = "", err = ""
+        var env = fakeCLIEnvironment(stdout: { out += $0 }, stderr: { err += $0 })
+        env.readAppSettings = {
+            ["debugLoggingEnabled": .bool(false), "menuBarIconStyle": .string("color"), "menuBarIconIdleColor": .string("")]
+        }
+        env.writeAppSettings = { writes.append($0); return nil }
+
+        let bad = SyncTrayCLI.execute(["settings", "set", "debugLoggingEnabled", "true", "menuBarIconStyle", "neon"], env: env)
+        guard bad == 65, writes.isEmpty, err.contains("color|monochrome|custom") else {
+            return report(name, slug, false, "(a bad value didn't refuse before writing: exit \(bad), writes \(writes), err \(err.debugDescription))")
+        }
+        err = ""
+        guard SyncTrayCLI.execute(["settings", "set", "nope", "1"], env: env) == 65, writes.isEmpty, err.contains("unknown setting") else {
+            return report(name, slug, false, "(an unknown key wasn't refused)")
+        }
+        out = ""
+        let ok = SyncTrayCLI.execute(["settings", "set", "menuBarIconSyncingColor", "ff8800", "debugLoggingEnabled", "yes"], env: env)
+        guard ok == 0, writes == [["menuBarIconSyncingColor": .string("#FF8800"), "debugLoggingEnabled": .bool(true)]],
+              out == "debugLoggingEnabled=true\nmenuBarIconSyncingColor=#FF8800\n" else {
+            return report(name, slug, false, "(settings set wrote \(writes) / printed \(out.debugDescription))")
+        }
+        out = ""
+        guard SyncTrayCLI.execute(["settings"], env: env) == 0,
+              out == "debugLoggingEnabled=false\nmenuBarIconStyle=color\nmenuBarIconIdleColor=\n" else {
+            return report(name, slug, false, "(settings show printed \(out.debugDescription))")
+        }
+        out = ""
+        guard SyncTrayCLI.execute(["settings", "--json"], env: env) == 0,
+              let shown = (try? JSONSerialization.jsonObject(with: Data(out.utf8))) as? [String: Any],
+              shown["debugLoggingEnabled"] as? Bool == false, shown["menuBarIconStyle"] as? String == "color" else {
+            return report(name, slug, false, "(settings --json printed \(out.debugDescription))")
+        }
+        out = ""
+        guard SyncTrayCLI.execute(["settings", "get", "menuBarIconStyle"], env: env) == 0, out == "color\n",
+              SyncTrayCLI.execute(["settings", "get", "nope"], env: env) == 65 else {
+            return report(name, slug, false, "(settings get wrong: \(out.debugDescription))")
+        }
+
+        // Launch applies only keys changed outside the app since its last write.
+        let snapshot: [String: Any] = [
+            "debugLoggingEnabled": false, "autoFixSyncIssues": true, "telemetryEnabled": false, "launchAtLogin": false,
+            "menuBarIconStyle": "color", "menuBarIconSyncingColor": "", "menuBarIconIdleColor": "",
+        ]
+        // (a) The banner turned usage data on without rewriting the file: the stale `false` must not apply.
+        let bannerCase = AppSettingsFileStore.keysChangedSinceLastWrite(file: snapshot, snapshot: snapshot)
+        // (b) The CLI's merge write changed one key and carried the rest as the file had them.
+        var cliFile = snapshot
+        cliFile["debugLoggingEnabled"] = true
+        let cliCase = AppSettingsFileStore.keysChangedSinceLastWrite(file: cliFile, snapshot: snapshot)
+        // (c) A hand edit while the app was closed; a re-cased color is not a change.
+        var handSnapshot = snapshot
+        handSnapshot["menuBarIconIdleColor"] = "#ABCDEF"
+        var handFile = handSnapshot
+        handFile["menuBarIconStyle"] = "Monochrome"
+        handFile["menuBarIconIdleColor"] = "#abcdef"
+        let handCase = AppSettingsFileStore.keysChangedSinceLastWrite(file: handFile, snapshot: handSnapshot)
+        // (e) An invalid value never applies; a key missing from the snapshot counts as changed.
+        var invalidFile = snapshot
+        invalidFile["menuBarIconStyle"] = "neon"
+        invalidFile["telemetryEnabled"] = "yes"
+        var partialSnapshot = snapshot
+        partialSnapshot["menuBarIconIdleColor"] = nil
+        var newKeyFile = snapshot
+        newKeyFile["menuBarIconIdleColor"] = "#00FF00"
+        guard bannerCase.isEmpty,
+              cliCase == ["debugLoggingEnabled"],
+              handCase == ["menuBarIconStyle"],
+              AppSettingsFileStore.keysChangedSinceLastWrite(file: cliFile, snapshot: nil).isEmpty,  // (d)
+              AppSettingsFileStore.keysChangedSinceLastWrite(file: invalidFile, snapshot: snapshot).isEmpty,
+              AppSettingsFileStore.keysChangedSinceLastWrite(file: newKeyFile, snapshot: partialSnapshot) == ["menuBarIconIdleColor"] else {
+            return report(name, slug, false, "(launch change set wrong: banner \(bannerCase), cli \(cliCase), hand \(handCase))")
+        }
+
+        // The app's whole-file write stores a snapshot equal to the values it wrote.
+        let snapshotSuite = "synctray.selftest.appsettings.snapshot"
+        guard let snapshotDefaults = UserDefaults(suiteName: snapshotSuite) else {
+            return report(name, slug, false, "(couldn't create a UserDefaults suite)")
+        }
+        snapshotDefaults.removePersistentDomain(forName: snapshotSuite)
+        let snapshotDir = "\(dir)/snapshot"
+        let writtenPath = AppSettingsFileStore.writeSettingsFile(isLoginItemEnabled: true, directory: snapshotDir, defaults: snapshotDefaults)
+        var writtenValues = writtenPath.flatMap { AppSettingsFileStore.readSettingsFileJSON(at: $0) } ?? [:]
+        writtenValues["$schema"] = nil
+        let stored = AppSettingsFileStore.lastWrittenSnapshot(defaults: snapshotDefaults)
+        snapshotDefaults.removePersistentDomain(forName: snapshotSuite)
+        guard writtenPath != nil, let stored, Set(stored.keys) == Set(AppSettingsFileStore.allKeyNames),
+              NSDictionary(dictionary: stored).isEqual(to: writtenValues),
+              AppSettingsFileStore.keysChangedSinceLastWrite(file: writtenValues, snapshot: stored).isEmpty else {
+            return report(name, slug, false, "(writeSettingsFile's snapshot \(String(describing: stored)) != written \(writtenValues))")
+        }
+
+        guard let managerSource = readSourceFile("Services/SyncManager.swift"),
+              let decideAt = managerSource.range(of: "AppSettingsFileStore.keysChangedSinceLastWrite("),
+              let applyAt = managerSource.range(
+                of: "applySettingsFile(includeLoginItem: false, onlyKeys: changedOutsideApp)",
+                range: decideAt.upperBound..<managerSource.endIndex),
+              let rewriteAt = managerSource.range(of: "refreshSettingsFile()", range: applyAt.upperBound..<managerSource.endIndex),
+              !managerSource[decideAt.upperBound..<rewriteAt.lowerBound].contains("func ") else {
+            return report(name, slug, false, "(launch doesn't apply the outside-the-app changes in settings.json before rewriting it)")
+        }
+        // The live watcher path uses the same filter, then rewrites the file and snapshot.
+        guard let liveBody = extractFunctionBody(startingAt: "func applyExternalSettingsEdit()", in: managerSource),
+              let liveGuardAt = liveBody.range(of: "guard let file = AppSettingsFileStore.readSettingsFileJSON() else { return }"),
+              let liveDecideAt = liveBody.range(
+                of: "let changed = AppSettingsFileStore.keysChangedSinceLastWrite(",
+                range: liveGuardAt.upperBound..<liveBody.endIndex),
+              let liveApplyAt = liveBody.range(
+                of: "applySettingsFile(includeLoginItem: true, onlyKeys: changed)",
+                range: liveDecideAt.upperBound..<liveBody.endIndex),
+              liveBody.range(of: "refreshSettingsFile()", range: liveApplyAt.upperBound..<liveBody.endIndex) != nil else {
+            return report(name, slug, false, "(applyExternalSettingsEdit doesn't skip an unreadable file, then apply only the outside-the-app changes and rewrite settings.json)")
+        }
+
+        return report(name, slug, true)
+    }
+
     // MARK: - AC-CLI13 — the CLI asks for the app's telemetry consent once, shares it
 
     /// The CLI's first-run question must only appear for a person at a terminal who
@@ -3880,6 +4335,173 @@ enum ConfigSelfTest {
         return report(name, slug, true)
     }
 
+    // MARK: - AC-CLI15 — doctor judges a lock file by its holder's liveness
+
+    /// `doctor`'s lock check (plan D4) must report a live holder as `ok` "sync running (PID n)"
+    /// (or "mount running" for a Stream profile), a dead holder as `warn` "stale lock file (PID
+    /// n not running)" while still exiting 0, `.pending` as `ok` "sync starting", an unparseable
+    /// present lock as `warn` "stale lock file (no PID recorded)", and no lock file at all as
+    /// `ok` "no stale lock" — never the old existence-only "stale lock file present".
+    private static func testDoctorLockLiveness() -> Bool {
+        let name = "AC-CLI15", slug = "doctor-lock-liveness"
+        let alwaysAlive: (Int32) -> Bool = { _ in true }
+        let neverAlive: (Int32) -> Bool = { _ in false }
+
+        let live = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "4242", isMount: false, isAlive: alwaysAlive)
+        guard live.status == .ok, live.detail == "sync running (PID 4242)" else {
+            return report(name, slug, false, "(live PID did not report ok sync running: \(live))")
+        }
+        let liveMount = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "4242", isMount: true, isAlive: alwaysAlive)
+        guard liveMount.status == .ok, liveMount.detail == "mount running (PID 4242)" else {
+            return report(name, slug, false, "(live PID on a mount profile did not say mount running: \(liveMount))")
+        }
+        let dead = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "4242", isMount: false, isAlive: neverAlive)
+        guard dead.status == .warn, dead.detail == "stale lock file (PID 4242 not running)" else {
+            return report(name, slug, false, "(dead PID did not report warn stale: \(dead))")
+        }
+        let pending = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "pending", isMount: false, isAlive: neverAlive)
+        guard pending.status == .ok, pending.detail == "sync starting" else {
+            return report(name, slug, false, "(.pending did not report ok sync starting: \(pending))")
+        }
+        let unreadable = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "garbage", isMount: false, isAlive: neverAlive)
+        guard unreadable.status == .warn, unreadable.detail == "stale lock file (no PID recorded)" else {
+            return report(name, slug, false, "(unreadable holder did not report warn no PID: \(unreadable))")
+        }
+        let emptyContents = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: nil, isMount: false, isAlive: neverAlive)
+        guard emptyContents.status == .warn, emptyContents.detail == "stale lock file (no PID recorded)" else {
+            return report(name, slug, false, "(present-but-unreadable lock did not report warn no PID: \(emptyContents))")
+        }
+        let absent = SyncTrayCLI.lockCheck(label: "p", exists: false, contents: nil, isMount: false, isAlive: alwaysAlive)
+        guard absent.status == .ok, absent.detail == "no stale lock" else {
+            return report(name, slug, false, "(absent lock did not report ok no stale lock: \(absent))")
+        }
+        // lockCheck must delegate liveness to SyncRunLock.isLive, so doctor and the app's
+        // single-run guard can never disagree about whether a lock is live.
+        guard let lockSource = readSourceFile("CLI/SyncTrayCLI.swift"),
+              lockSource.contains("SyncRunLock.isLive(holder, isAlive: isAlive)") else {
+            return report(name, slug, false, "(lockCheck no longer judges liveness via SyncRunLock.isLive)")
+        }
+
+        // Full doctor run: a dead-holder lock is a .warn, never a .fail, and exits 0.
+        let profile = sampleProfile(isEnabled: false)
+        let doctorEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            readProfiles: { [profile] },
+            fileExists: { path in path == profile.configPath || path == profile.lockFilePath },
+            schemaFilesPresent: { true },
+            readFile: { path in path == profile.lockFilePath ? "99999999" : nil },
+            processIsAlive: { _ in false }
+        )
+        let doctorChecks = SyncTrayCLI.doctorChecks(env: doctorEnv)
+        guard doctorChecks.contains(where: { $0.status == .warn && $0.detail.contains("not running") }) else {
+            return report(name, slug, false, "(a dead-PID lock did not surface as a warn in the full doctor report)")
+        }
+        guard SyncTrayCLI.run(.doctor, env: doctorEnv) == 0 else {
+            return report(name, slug, false, "(a stale-but-dead lock should not fail the doctor run)")
+        }
+
+        guard let cliSource = readSourceFile("CLI/SyncTrayCLI.swift"),
+              !cliSource.contains("\"stale lock file present\"") else {
+            return report(name, slug, false, "(the old existence-only lock message is still present)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-CLI16 — doctor/test-remote probe with lsjson --stat, never lsd
+
+    /// `remoteProbe` runs `lsjson --stat <remote>:<path>` (never `lsd`), treats exits 0/3/4 as
+    /// reachable, reports the CLI's own watchdog-timeout sentinel as "timed out after 15s", and
+    /// `rcloneFailureSummary` prefers an ERROR/CRITICAL stderr line over a NOTICE line (rclone's
+    /// shared-client_id notice was previously echoed as "the error").
+    private static func testRemoteProbePathScopedAndSummarized() -> Bool {
+        let name = "AC-CLI16", slug = "remote-probe-path-scoped"
+        var profile = sampleProfile()
+        profile.rcloneRemote = "myremote:"
+        profile.remotePath = "Some Path"
+
+        var capturedArgs: [String] = []
+        let okEnv = fakeCLIEnvironment(runRclone: { args, _ in capturedArgs = args; return (0, "{}", "") })
+        let okProbe = SyncTrayCLI.remoteProbe(for: profile, env: okEnv)
+        guard okProbe.reachable, !okProbe.pathMissing, okProbe.detail == "remote reachable",
+              capturedArgs.contains("lsjson"), capturedArgs.contains("--stat"),
+              capturedArgs.contains("myremote:Some Path"), !capturedArgs.contains("lsd") else {
+            return report(name, slug, false, "(exit 0 did not probe with lsjson --stat: \(capturedArgs))")
+        }
+
+        for exit: Int32 in [3, 4] {
+            let env = fakeCLIEnvironment(runRclone: { _, _ in (exit, "", "") })
+            let probe = SyncTrayCLI.remoteProbe(for: profile, env: env)
+            guard probe.reachable else {
+                return report(name, slug, false, "(exit \(exit) was not treated as reachable)")
+            }
+            // A missing path stays visible: doctor renders `pathMissing` as a warning, not "ok".
+            guard probe.pathMissing, probe.detail == "remote reachable, but path not found: Some Path" else {
+                return report(name, slug, false, "(exit \(exit) did not flag the missing path: \(probe))")
+            }
+        }
+
+        let timeoutEnv = fakeCLIEnvironment(runRclone: { _, _ in (CLIEnvironment.rcloneTimedOutExitCode, "", "") })
+        let timeoutProbe = SyncTrayCLI.remoteProbe(for: profile, env: timeoutEnv)
+        guard !timeoutProbe.reachable, timeoutProbe.detail == "remote unreachable: timed out after 15s" else {
+            return report(name, slug, false, "(a watchdog timeout was not reported by name: \(timeoutProbe))")
+        }
+
+        let noticeAndError = """
+            2026/10/19 09:00:00 NOTICE: Google drive root '': Auto set your own client_id
+            2026/10/19 09:00:01 ERROR : : error listing: directory not found
+            """
+        let errorEnv = fakeCLIEnvironment(runRclone: { _, _ in (1, "", noticeAndError) })
+        let errorProbe = SyncTrayCLI.remoteProbe(for: profile, env: errorEnv)
+        guard !errorProbe.reachable, errorProbe.detail == "remote unreachable: ERROR : : error listing: directory not found" else {
+            return report(name, slug, false, "(the NOTICE line was echoed instead of the ERROR line: \(errorProbe))")
+        }
+
+        let noticeOnly = "2026/10/19 09:00:00 NOTICE: Google drive root '': Auto set your own client_id"
+        guard SyncTrayCLI.rcloneFailureSummary(stderr: noticeOnly) == nil else {
+            return report(name, slug, false, "(a NOTICE-only stderr should summarize to nil)")
+        }
+        let noticeOnlyEnv = fakeCLIEnvironment(runRclone: { _, _ in (1, "", noticeOnly) })
+        guard SyncTrayCLI.remoteProbe(for: profile, env: noticeOnlyEnv).detail == "remote unreachable: rclone exited 1" else {
+            return report(name, slug, false, "(a NOTICE-only failure did not fall back to 'rclone exited N')")
+        }
+
+        var certArgs: [String] = []
+        let certEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in certArgs = args; return (0, "", "") },
+            remoteSkipsCertCheck: { $0 == "myremote" }
+        )
+        _ = SyncTrayCLI.remoteProbe(for: profile, env: certEnv)
+        guard certArgs.contains("--no-check-certificate") else {
+            return report(name, slug, false, "(remoteSkipsCertCheck was not honoured: \(certArgs))")
+        }
+
+        var emptyRemote = profile
+        emptyRemote.rcloneRemote = ""
+        let noRemoteProbe = SyncTrayCLI.remoteProbe(for: emptyRemote, env: fakeCLIEnvironment())
+        guard !noRemoteProbe.reachable, noRemoteProbe.detail.contains("no remote configured") else {
+            return report(name, slug, false, "(an empty remote did not report 'no remote configured': \(noRemoteProbe))")
+        }
+
+        // doctor and test-remote both route through the one probe — same args, never `lsd`.
+        guard let cliSource = readSourceFile("CLI/SyncTrayCLI.swift"), !cliSource.contains("\"lsd\"") else {
+            return report(name, slug, false, "(SyncTrayCLI.swift still references the old lsd probe)")
+        }
+        // End to end: a missing path is a doctor warning, never ok and never a failure.
+        let missingPathProfile = sampleProfile(isEnabled: false)
+        let missingPathEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (3, "", "") },
+            readProfiles: { [missingPathProfile] },
+            fileExists: { $0 == missingPathProfile.configPath },
+            schemaFilesPresent: { true }
+        )
+        let missingPathChecks = SyncTrayCLI.doctorChecks(env: missingPathEnv)
+        guard missingPathChecks.contains(where: { $0.status == .warn && $0.detail.hasPrefix("remote reachable, but path not found") }),
+              !missingPathChecks.contains(where: { $0.status == .fail }) else {
+            return report(name, slug, false, "(doctor did not report a missing path as a warning: \(missingPathChecks))")
+        }
+        return report(name, slug, true)
+    }
+
     // MARK: - AC-SEC4 — the mount-mode file never lives in the shared /tmp
 
     /// The sync script writes the mode token with a plain `echo > "$MOUNT_MODE_PATH"`, which
@@ -3916,6 +4538,66 @@ enum ConfigSelfTest {
               !SyncSetupService.derivedConfigHasStaleMountModePath(config(nil), expected: path),
               !SyncSetupService.derivedConfigHasStaleMountModePath(nil, expected: path) else {
             return report(name, slug, false, "(stale-derived-config detection wrong)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SEC5 — the sync-log and profile directories are owner-only
+
+    /// The sync logs name every synced file and the profile JSON names remotes, local paths
+    /// and extra rclone flags. Earlier versions created both directories with the default
+    /// mode (0755), so on a Mac whose home folder other accounts can traverse, they could
+    /// read them (CWE-276). Asserts the launch-time tighten drops group/other bits from a
+    /// loose directory owned by this user, leaves an already-0700 directory, a symlink (and
+    /// its target), a regular file and a missing path alone, and that the profile writer
+    /// creates a new directory 0700. Also pins the once-per-launch call.
+    private static func testLogAndProfileDirsOwnerOnly() -> Bool {
+        let name = "AC-SEC5", slug = "log-and-profile-dirs-owner-only"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/sec5-\(UUID().uuidString)"
+        defer { try? fm.removeItem(atPath: root) }
+
+        func makeDir(_ path: String, mode: Int) -> Bool {
+            (try? fm.createDirectory(atPath: path, withIntermediateDirectories: true)) != nil
+                && (try? fm.setAttributes([.posixPermissions: mode], ofItemAtPath: path)) != nil
+        }
+        func mode(_ path: String) -> Int? {
+            ((try? fm.attributesOfItem(atPath: path))?[.posixPermissions] as? Int).map { $0 & 0o777 }
+        }
+
+        let loose = "\(root)/loose", tight = "\(root)/tight", target = "\(root)/target"
+        let link = "\(root)/link", file = "\(root)/file", missing = "\(root)/missing"
+        guard makeDir(loose, mode: 0o755), makeDir(tight, mode: 0o700), makeDir(target, mode: 0o755),
+              (try? fm.createSymbolicLink(atPath: link, withDestinationPath: target)) != nil,
+              fm.createFile(atPath: file, contents: nil, attributes: [.posixPermissions: 0o644]) else {
+            return report(name, slug, false, "(could not create fixtures under \(root))")
+        }
+
+        guard SyncSetupService.tightenDirectoryIfLoose(atPath: loose), mode(loose) == 0o700 else {
+            return report(name, slug, false, "(a 0755 directory was not tightened to 0700: \(String(describing: mode(loose))))")
+        }
+        guard !SyncSetupService.tightenDirectoryIfLoose(atPath: tight), mode(tight) == 0o700 else {
+            return report(name, slug, false, "(an already-0700 directory was changed)")
+        }
+        guard !SyncSetupService.tightenDirectoryIfLoose(atPath: link), mode(target) == 0o755 else {
+            return report(name, slug, false, "(a symlinked directory was followed and changed)")
+        }
+        guard !SyncSetupService.tightenDirectoryIfLoose(atPath: file), mode(file) == 0o644 else {
+            return report(name, slug, false, "(a regular file was changed)")
+        }
+        guard !SyncSetupService.tightenDirectoryIfLoose(atPath: missing), !fm.fileExists(atPath: missing) else {
+            return report(name, slug, false, "(a missing path was created or reported as tightened)")
+        }
+
+        let profilesDir = "\(root)/profiles"
+        guard ProfileStore.writeProfileFile(sampleProfile(), in: profilesDir) != nil,
+              mode(profilesDir) == 0o700 else {
+            return report(name, slug, false, "(the profile writer created its directory with mode \(String(describing: mode(profilesDir))), not 0700)")
+        }
+
+        guard let appSource = readSourceFile("SyncTrayApp.swift"),
+              appSource.contains("SyncSetupService.tightenPrivateDirectoriesIfLoose()") else {
+            return report(name, slug, false, "(SyncTrayApp no longer tightens the directories at launch)")
         }
         return report(name, slug, true)
     }
@@ -7481,6 +8163,2091 @@ enum ConfigSelfTest {
         return report("AC-SR6", "prior-lock-file-rejected-run", true)
     }
 
+    // MARK: - AC-NFS1 — go-nfs's exclusive-create notice is not a profile error
+
+    /// `rclone nfsmount` (go-nfs) logs "failing create to indicate lack of support for
+    /// 'exclusive' mode." at ERROR for every O_EXCL create on a Stream mount, and macOS
+    /// retries the create without O_EXCL, which succeeds. The line must not become an
+    /// `.errorMessage` (which records a "Sync error" and raises a "Last sync error" banner
+    /// that a mount never clears), while a genuine rclone error line still must.
+    private static func testNFSExclusiveCreateNoticeNotAnError() -> Bool {
+        let notice = "failing create to indicate lack of support for 'exclusive' mode."
+        guard SyncLogPatterns.isBenignNFSExclusiveCreateNotice(notice),
+              SyncLogPatterns.isBenignNFSExclusiveCreateNotice("nfs: " + notice.uppercased()) else {
+            return report("AC-NFS1", "nfs-exclusive-create-not-an-error", false,
+                          "(isBenignNFSExclusiveCreateNotice did not match go-nfs's notice)")
+        }
+        guard !SyncLogPatterns.isBenignNFSExclusiveCreateNotice("Failed to copy: permission denied") else {
+            return report("AC-NFS1", "nfs-exclusive-create-not-an-error", false,
+                          "(isBenignNFSExclusiveCreateNotice matched an unrelated error)")
+        }
+
+        let parser = LogParser()
+        let noticeLine = #"{"level":"error","msg":"failing create to indicate lack of support for 'exclusive' mode.","source":"nfs/nfs_oncreate.go:42","time":"2026-10-17T14:02:46.706+02:00"}"#
+        guard let noticeEvent = parser.parse(line: noticeLine) else {
+            return report("AC-NFS1", "nfs-exclusive-create-not-an-error", false,
+                          "(the go-nfs JSON log line did not parse)")
+        }
+        if case .errorMessage = noticeEvent.type {
+            return report("AC-NFS1", "nfs-exclusive-create-not-an-error", false,
+                          "(the go-nfs exclusive-create notice was surfaced as an errorMessage)")
+        }
+
+        let realErrorLine = #"{"level":"error","msg":"Failed to copy: permission denied","time":"2026-10-17T14:02:46.706+02:00"}"#
+        guard let realEvent = parser.parse(line: realErrorLine),
+              case .errorMessage = realEvent.type else {
+            return report("AC-NFS1", "nfs-exclusive-create-not-an-error", false,
+                          "(a genuine rclone error line was no longer surfaced as an errorMessage)")
+        }
+        return report("AC-NFS1", "nfs-exclusive-create-not-an-error", true)
+    }
+
+    // MARK: - AC-PL1 — Apple Photos libraries are excluded by default
+
+    /// A new filter file carries `- *.photoslibrary/**`, and `addingPhotosLibraryDefault`
+    /// inserts it below the managed "Don't Sync" block and above the user's own rules
+    /// (including a `+` include, which would otherwise win first-match), stays stable under a
+    /// later `merged`, and never touches a file that already mentions `.photoslibrary`.
+    private static func testPhotosLibraryDefaultExclude() -> Bool {
+        let name = "AC-PL1", slug = "photos-library-default-exclude"
+        let rule = SyncExcludeFilter.photosLibraryRule
+
+        // 1. Defaults written on first create include the rule.
+        let dir = "\(selfTestRoot)/pl1"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = "\(dir)/exclude.txt"
+        var profile = sampleProfile()
+        profile.syncMode = .sync
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: path)
+        } catch {
+            return report(name, slug, false, "(first write threw: \(error))")
+        }
+        guard let fresh = try? String(contentsOfFile: path, encoding: .utf8),
+              fresh.contains("\n\(rule)\n"), fresh.contains("- .DS_Store") else {
+            return report(name, slug, false, "(a new filter file is missing \(rule))")
+        }
+
+        // 2. Inserted below the managed block, above the user's own rules.
+        let patterns = ["*.bak"]
+        let existing = SyncExcludeFilter.merged(existing: "- my-own-rule\n+ keep/**\n", patterns: patterns)
+        guard let migrated = SyncExcludeFilter.addingPhotosLibraryDefault(to: existing),
+              migrated.hasPrefix(SyncExcludeFilter.beginMarker),
+              let endRange = migrated.range(of: SyncExcludeFilter.endMarker),
+              let ruleRange = migrated.range(of: rule),
+              let includeRange = migrated.range(of: "+ keep/**"),
+              endRange.upperBound <= ruleRange.lowerBound,
+              ruleRange.upperBound <= includeRange.lowerBound,
+              migrated.contains("- my-own-rule"),
+              migrated.contains("- *.bak") else {
+            return report(name, slug, false, "(rule not placed between the managed block and the user's rules)")
+        }
+        guard SyncExcludeFilter.merged(existing: migrated, patterns: patterns) == migrated else {
+            return report(name, slug, false, "(a later merge with the same patterns rewrote the migrated file)")
+        }
+
+        // 3. No managed block: the rule goes first, the user's content follows untouched.
+        guard let plain = SyncExcludeFilter.addingPhotosLibraryDefault(to: "- my-own-rule\n"),
+              plain == SyncExcludeFilter.photosLibrarySection + "\n\n- my-own-rule\n" else {
+            return report(name, slug, false, "(unexpected output for a file without a managed block)")
+        }
+        guard SyncExcludeFilter.addingPhotosLibraryDefault(to: "") == SyncExcludeFilter.photosLibrarySection + "\n" else {
+            return report(name, slug, false, "(unexpected output for an empty file)")
+        }
+
+        // 4. Already present, or the user's own rule for it: left alone.
+        guard SyncExcludeFilter.addingPhotosLibraryDefault(to: fresh) == nil,
+              SyncExcludeFilter.addingPhotosLibraryDefault(to: "+ Photos Library.photoslibrary/**\n") == nil,
+              SyncExcludeFilter.addingPhotosLibraryDefault(to: "- Old.PhotosLibrary/**\n") == nil else {
+            return report(name, slug, false, "(a file that already mentions .photoslibrary was changed)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-PL2 — migration v5 adds the rule to existing profiles, once
+
+    /// Every Two-Way and One-Way profile's existing filter gains the rule; a Two-Way profile
+    /// whose folder holds a library also gets the resync-pending marker; Stream profiles,
+    /// missing filters and filters that already mention `.photoslibrary` are untouched; a
+    /// second pass changes nothing. Also exercises the real bounded folder walk.
+    private static func testMigrationV5PhotosLibraryExclude() -> Bool {
+        let name = "AC-PL2", slug = "migration-v5-photos-library"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/pl2"
+        try? fm.removeItem(atPath: dir)
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        struct Fixture {
+            let id = UUID()
+            let syncMode: String?
+            let localPath: String
+            let filter: String?
+            var shortId: String { String(id.uuidString.prefix(8)).lowercased() }
+        }
+        let withLibrary = "/tmp/synctray-selftest-pl2-with-library"
+        let fixtures: [String: Fixture] = [
+            "bisyncWithLibrary": Fixture(syncMode: "bisync", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "oneWayWithLibrary": Fixture(syncMode: "sync", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "bisyncNoLibrary": Fixture(syncMode: "bisync", localPath: "/tmp/synctray-selftest-pl2-plain", filter: "- .DS_Store\n"),
+            "legacyNoMode": Fixture(syncMode: nil, localPath: withLibrary, filter: "- .DS_Store\n"),
+            "mount": Fixture(syncMode: "mount", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "userRule": Fixture(syncMode: "bisync", localPath: withLibrary, filter: "+ *.photoslibrary/**\n"),
+            "noFilter": Fixture(syncMode: "bisync", localPath: withLibrary, filter: nil),
+        ]
+        for fixture in fixtures.values {
+            var dict: [String: Any] = ["id": fixture.id.uuidString, "name": "PL2", "localSyncPath": fixture.localPath]
+            if let mode = fixture.syncMode { dict["syncMode"] = mode }
+            guard let data = try? JSONSerialization.data(withJSONObject: dict),
+                  (try? data.write(to: URL(fileURLWithPath: "\(dir)/\(fixture.shortId).profile.json"))) != nil else {
+                return report(name, slug, false, "(failed to seed a profile file)")
+            }
+            if let filter = fixture.filter {
+                try? filter.write(toFile: "\(dir)/\(fixture.shortId)-exclude.txt", atomically: true, encoding: .utf8)
+            }
+        }
+        func filter(_ key: String) -> String? {
+            try? String(contentsOfFile: "\(dir)/\(fixtures[key]!.shortId)-exclude.txt", encoding: .utf8)
+        }
+        func hasMarker(_ key: String) -> Bool {
+            fm.fileExists(atPath: "\(dir)/\(fixtures[key]!.shortId).resync-pending")
+        }
+
+        let outcome = MigrationV5PhotosLibraryExclude.addPhotosLibraryExclude(in: dir) { $0 == withLibrary }
+        let expectedUpdated = ["bisyncWithLibrary", "oneWayWithLibrary", "bisyncNoLibrary", "legacyNoMode"]
+            .map { fixtures[$0]!.shortId }.sorted()
+        guard outcome.updated.sorted() == expectedUpdated,
+              outcome.resyncScheduled.sorted() == ["bisyncWithLibrary", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
+              outcome.failed.isEmpty else {
+            return report(name, slug, false, "(unexpected outcome: \(outcome))")
+        }
+        for key in ["bisyncWithLibrary", "oneWayWithLibrary", "bisyncNoLibrary", "legacyNoMode"] {
+            guard let text = filter(key), text.contains(SyncExcludeFilter.photosLibraryRule), text.hasSuffix("- .DS_Store\n") else {
+                return report(name, slug, false, "(\(key) filter did not gain the rule above its own content)")
+            }
+        }
+        guard hasMarker("bisyncWithLibrary"), hasMarker("legacyNoMode"),
+              !hasMarker("oneWayWithLibrary"), !hasMarker("bisyncNoLibrary") else {
+            return report(name, slug, false, "(resync marker written for the wrong profiles)")
+        }
+        guard filter("mount") == "- .DS_Store\n", filter("userRule") == "+ *.photoslibrary/**\n",
+              !hasMarker("mount"), !hasMarker("userRule"),
+              filter("noFilter") == nil else {
+            return report(name, slug, false, "(a Stream profile, a user rule, or a missing filter was touched)")
+        }
+
+        // Idempotent: a second pass changes nothing, including the scheduled token.
+        let markerPath = "\(dir)/\(fixtures["bisyncWithLibrary"]!.shortId).resync-pending"
+        let token = try? String(contentsOfFile: markerPath, encoding: .utf8)
+        let filtersBefore = fixtures.keys.sorted().map { filter($0) }
+        let second = MigrationV5PhotosLibraryExclude.addPhotosLibraryExclude(in: dir) { $0 == withLibrary }
+        guard second == MigrationV5PhotosLibraryExclude.Outcome(),
+              fixtures.keys.sorted().map({ filter($0) }) == filtersBefore,
+              (try? String(contentsOfFile: markerPath, encoding: .utf8)) == token else {
+            return report(name, slug, false, "(a second pass changed something)")
+        }
+
+        // The real bounded walk: found within the depth limit, not past it, not in hidden folders.
+        let tree = "\(selfTestRoot)/pl2-tree"
+        try? fm.removeItem(atPath: tree)
+        try? fm.createDirectory(atPath: "\(tree)/shallow/a/b/Photos Library.photoslibrary", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/deep/a/b/c/d/Photos Library.photoslibrary", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/hidden/.cache/Photos Library.photoslibrary", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/none/a/b", withIntermediateDirectories: true)
+        guard MigrationV5PhotosLibraryExclude.containsPhotosLibrary(under: "\(tree)/shallow"),
+              !MigrationV5PhotosLibraryExclude.containsPhotosLibrary(under: "\(tree)/deep"),
+              !MigrationV5PhotosLibraryExclude.containsPhotosLibrary(under: "\(tree)/hidden"),
+              !MigrationV5PhotosLibraryExclude.containsPhotosLibrary(under: "\(tree)/none"),
+              !MigrationV5PhotosLibraryExclude.containsPhotosLibrary(under: "\(tree)/missing") else {
+            return report(name, slug, false, "(containsPhotosLibrary walk gave a wrong answer)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-PL3 — macOS privacy denials are recognized, kept whole and categorized
+
+    /// The real rclone line for a Photos library macOS won't let it read: its local path is
+    /// extracted (spaces included), recognized as a LOCAL denial only inside the sync folder,
+    /// kept whole by `LogParser` even past 200 characters, turned into the right "Don't Sync"
+    /// pattern, and categorized `permission_denied` — while rclone's closing "not deleting
+    /// files as there were IO errors" notice is `io_errors_blocked_deletes`.
+    private static func testMacOSBlockedAccessPatterns() -> Bool {
+        let name = "AC-PL3", slug = "macos-blocked-access-patterns"
+        let root = "/Users/someone/Pictures"
+        let library = "\(root)/Photos Library.photoslibrary"
+        let message = "failed to open directory \"Photos Library.photoslibrary\": open \(library): operation not permitted"
+
+        guard SyncLogPatterns.isOperationNotPermitted(message),
+              SyncLogPatterns.operationNotPermittedPath(in: message) == library,
+              SyncLogPatterns.macOSBlockedPath(in: message, localSyncPath: root) == library,
+              SyncLogPatterns.macOSBlockedPath(in: message, localSyncPath: root + "/") == library,
+              SyncLogPatterns.macOSBlockedPath(in: message, localSyncPath: "/Users/someone/Documents") == nil,
+              SyncLogPatterns.macOSBlockedAccessSummary(for: message, localSyncPath: root)
+                == "macOS blocked access to “Photos Library.photoslibrary”.",
+              SyncLogPatterns.isDirectoryOpenFailure(message) else {
+            return report(name, slug, false, "(the Photos-library denial was not recognized as a local macOS block)")
+        }
+        let remoteEPERM = "Failed to copy: sftp: open /home/me/share/x.txt: operation not permitted"
+        guard SyncLogPatterns.operationNotPermittedPath(in: remoteEPERM) == "/home/me/share/x.txt",
+              SyncLogPatterns.macOSBlockedPath(in: remoteEPERM, localSyncPath: root) == nil,
+              SyncLogPatterns.operationNotPermittedPath(in: "Failed to copy: permission denied") == nil,
+              SyncLogPatterns.macOSBlockedAccessSummary(for: "Failed to copy: permission denied", localSyncPath: root) == nil else {
+            return report(name, slug, false, "(a remote or unrelated error was treated as a macOS block)")
+        }
+
+        // LogParser keeps a deep denial whole, but still truncates other long errors.
+        let parser = LogParser()
+        func jsonLine(_ msg: String, object: String? = nil) -> String? {
+            var dict: [String: Any] = ["level": "error", "msg": msg, "source": "local/local.go:676",
+                                       "time": "2026-10-13T07:12:38.48317+02:00"]
+            if let object { dict["object"] = object; dict["objectType"] = "string" }
+            return (try? JSONSerialization.data(withJSONObject: dict)).flatMap { String(data: $0, encoding: .utf8) }
+        }
+        // Shaped like rclone's real line, `object` included (an object routes a line through
+        // file-change parsing first; this one must still come out as an error).
+        let deepLibrary = root + "/" + String(repeating: "A Very Long Folder Name/", count: 10) + "Photos Library.photoslibrary"
+        let deepMessage = "failed to open directory \"Photos Library.photoslibrary\": open \(deepLibrary): operation not permitted"
+        guard let deepLine = jsonLine(deepMessage, object: "Photos Library.photoslibrary"),
+              let deepEvent = parser.parse(line: deepLine),
+              case .errorMessage(let kept) = deepEvent.type,
+              SyncLogPatterns.macOSBlockedPath(in: kept, localSyncPath: root) == deepLibrary else {
+            return report(name, slug, false, "(LogParser cut the path off a long privacy denial)")
+        }
+        guard let longLine = jsonLine("Failed to copy: " + String(repeating: "x", count: 400)),
+              let longEvent = parser.parse(line: longLine),
+              case .errorMessage(let truncated) = longEvent.type, truncated.count <= 203 else {
+            return report(name, slug, false, "(LogParser stopped truncating other long errors)")
+        }
+
+        // The "Don't Sync" pattern for the blocked path, and the rclone rule it compiles to.
+        guard SyncExcludeFilter.excludePattern(forBlockedPath: library, localSyncPath: root, isDirectory: true)
+                == "/Photos Library.photoslibrary/",
+              SyncExcludeFilter.rcloneRules(for: "/Photos Library.photoslibrary/") == ["/Photos Library.photoslibrary/**"],
+              SyncExcludeFilter.excludePattern(forBlockedPath: "\(root)/a/b.heic", localSyncPath: root + "/", isDirectory: false)
+                == "/a/b.heic",
+              SyncExcludeFilter.excludePattern(forBlockedPath: root, localSyncPath: root, isDirectory: true) == nil,
+              SyncExcludeFilter.excludePattern(forBlockedPath: "/Users/someone/Picturesque/x", localSyncPath: root, isDirectory: true) == nil else {
+            return report(name, slug, false, "(wrong Don't Sync pattern for a blocked path)")
+        }
+
+        // Telemetry buckets.
+        let closingNotice = "Failed to sync with 2 errors: last error was: not deleting files as there were IO errors"
+        let checks: [(String?, String)] = [
+            (message, "permission_denied"),
+            (closingNotice, "io_errors_blocked_deletes"),
+            ("not deleting directories as there were IO errors", "io_errors_blocked_deletes"),
+            ("Failed to copy: permission denied", "permission_denied"),
+            ("Bisync critical error: out of sync - must run --resync", "out_of_sync"),
+            ("something unexpected happened", "other"),
+            (nil, "unknown"),
+        ]
+        for (input, expected) in checks {
+            let got = TelemetryService.categorizeError(input)
+            guard got == expected else {
+                return report(name, slug, false, "(categorizeError(\(input.debugDescription)) = \(got), expected \(expected))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-PL4 — the failure path categorizes the root error; the banner acts on it
+
+    /// Source pins: `.syncFailed` reports the run's first error (not rclone's closing notice)
+    /// to telemetry; the error banner checks for a macOS block before the generic actions; the
+    /// Exclude action only STAGES the pattern into the form's "Don't Sync" state (it calls
+    /// neither `updateSyncExcludePatterns` — retired — nor `triggerManualSync`, and never
+    /// writes the filter file directly: that happens on Save, via `filterSaveFollowUp` — plan
+    /// D9/D10); and migration v8 is registered after v7.
+    private static func testMacOSBlockedAccessWiringPinned() -> Bool {
+        let name = "AC-PL4", slug = "macos-blocked-access-wiring"
+        guard let managerSource = readSourceFile("Services/SyncManager.swift"),
+              let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let migrationSource = readSourceFile("Services/MigrationRunner.swift") else {
+            return report(name, slug, false, "(could not read source files)")
+        }
+        guard managerSource.contains("errorMessage: profileErrors[profileId] ?? message"),
+              !managerSource.contains("errorMessage: message ?? profileErrors[profileId]") else {
+            return report(name, slug, false, "(recordSyncFailed is no longer given the run's first error)")
+        }
+        guard let blocked = viewSource.range(of: "if let blockedPath = SyncLogPatterns.macOSBlockedPath(in: lastError, localSyncPath: profile.localSyncPath) {"),
+              let generic = viewSource.range(of: "} else if let errorAction = detectErrorAction(from: lastError) {"),
+              blocked.upperBound <= generic.lowerBound else {
+            return report(name, slug, false, "(the error banner no longer offers the macOS-block actions first)")
+        }
+        guard let excludeFn = extractFunctionBody(startingAt: "private func stageBlockedPathExclusion()", in: viewSource),
+              !excludeFn.contains("syncManager.updateSyncExcludePatterns("),
+              !excludeFn.contains("triggerManualSync"),
+              !excludeFn.contains("writeExcludeFilter") else {
+            return report(name, slug, false, "(Exclude from Sync bypasses the Don't Sync list)")
+        }
+        guard migrationSource.contains("MigrationV7VolumeSystemFolderResyncFromListings(),\n        MigrationV8PhotoBoothLibraryExclude(),") else {
+            return report(name, slug, false, "(migration v8 is not registered after v7)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-PL5 — the Apple Photo Booth library is excluded by default
+
+    /// A new filter file carries `- Photo Booth Library/**`, and `addingDefault(.photoBoothLibrary:)`
+    /// inserts it below the managed "Don't Sync" block and above the user's own rules (including
+    /// a `+` include, which would otherwise win first-match), stays stable under a later
+    /// `merged`, and never touches a file that already mentions "photo booth library" (any case).
+    /// Mirrors AC-PL1's shape exactly, since both now share `SyncExcludeFilter.addingDefault`.
+    private static func testPhotoBoothLibraryDefaultExclude() -> Bool {
+        let name = "AC-PL5", slug = "photo-booth-library-default-exclude"
+        let def = SyncExcludeFilter.DefaultExclude.photoBoothLibrary
+        let rule = def.rule
+        guard rule == "- Photo Booth Library/**" else {
+            return report(name, slug, false, "(unexpected rule text: \(rule))")
+        }
+
+        // 1. Defaults written on first create include the rule.
+        let dir = "\(selfTestRoot)/pl5"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = "\(dir)/exclude.txt"
+        var profile = sampleProfile()
+        profile.syncMode = .sync
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: path)
+        } catch {
+            return report(name, slug, false, "(first write threw: \(error))")
+        }
+        guard let fresh = try? String(contentsOfFile: path, encoding: .utf8),
+              fresh.contains("\n\(rule)\n"), fresh.contains("- *.photoslibrary/**"), fresh.contains("- .DS_Store") else {
+            return report(name, slug, false, "(a new filter file is missing \(rule))")
+        }
+
+        // 2. Inserted below the managed block, above the user's own rules.
+        let patterns = ["*.bak"]
+        let existing = SyncExcludeFilter.merged(existing: "- my-own-rule\n+ keep/**\n", patterns: patterns)
+        guard let migrated = SyncExcludeFilter.addingDefault(def, to: existing),
+              migrated.hasPrefix(SyncExcludeFilter.beginMarker),
+              let endRange = migrated.range(of: SyncExcludeFilter.endMarker),
+              let ruleRange = migrated.range(of: rule),
+              let includeRange = migrated.range(of: "+ keep/**"),
+              endRange.upperBound <= ruleRange.lowerBound,
+              ruleRange.upperBound <= includeRange.lowerBound,
+              migrated.contains("- my-own-rule"),
+              migrated.contains("- *.bak") else {
+            return report(name, slug, false, "(rule not placed between the managed block and the user's rules)")
+        }
+        guard SyncExcludeFilter.merged(existing: migrated, patterns: patterns) == migrated else {
+            return report(name, slug, false, "(a later merge with the same patterns rewrote the migrated file)")
+        }
+
+        // 3. No managed block: the rule goes first, the user's content follows untouched.
+        guard let plain = SyncExcludeFilter.addingDefault(def, to: "- my-own-rule\n"),
+              plain == def.section + "\n\n- my-own-rule\n" else {
+            return report(name, slug, false, "(unexpected output for a file without a managed block)")
+        }
+        guard SyncExcludeFilter.addingDefault(def, to: "") == def.section + "\n" else {
+            return report(name, slug, false, "(unexpected output for an empty file)")
+        }
+
+        // 4. Already present (any case), or the user's own rule for it: left alone.
+        guard SyncExcludeFilter.addingDefault(def, to: fresh) == nil,
+              SyncExcludeFilter.addingDefault(def, to: "+ Photo Booth Library/**\n") == nil,
+              SyncExcludeFilter.addingDefault(def, to: "- photo booth library/**\n") == nil else {
+            return report(name, slug, false, "(a file that already mentions Photo Booth Library was changed)")
+        }
+
+        // 5. The name check must run before the isPackage skip — Photo Booth Library IS a
+        //    package, and the walk must still find it (not be skipped as package contents).
+        guard def.matchesEntry(URL(fileURLWithPath: "/tmp/x/Photo Booth Library")) else {
+            return report(name, slug, false, "(matchesEntry did not recognize the package by name)")
+        }
+        // Telemetry: a Photo Booth denial gets its own bounded kind, never the path.
+        let boothDenial = "ERROR : Pictures/Photo Booth Library: error reading source directory: "
+            + "open /Users/me/Pictures/Photo Booth Library: operation not permitted"
+        guard TelemetryService.blockedPathKind("/Users/me/Pictures/Photo Booth Library") == "photo_booth_library",
+              TelemetryService.blockedPathKind("/Users/me/Pictures/photo booth library/Pictures") == "photo_booth_library",
+              TelemetryService.blockedPathKind("/Users/me/Pictures/Photo Booth Library Backup") == "other",
+              TelemetryService.accessDenialAttributes(for: boothDenial, localSyncPath: "/Users/me/Pictures")["error.blocked_path.kind"]
+                == .string("photo_booth_library") else {
+            return report(name, slug, false, "(a Photo Booth denial isn't bucketed as photo_booth_library)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-PL6 — migration v8 adds the Photo Booth rule to existing profiles, once
+
+    /// Every Two-Way and One-Way profile's existing filter gains the rule; a Two-Way profile
+    /// whose folder holds a `Photo Booth Library` also gets the resync-pending marker; Stream
+    /// profiles, missing filters and filters that already mention "photo booth library" are
+    /// untouched; a second pass changes nothing. Also pins the filter-before-marker write order
+    /// (plan D3): a marker-write failure rolls the filter back, and a filter-write failure never
+    /// schedules a marker.
+    private static func testMigrationV8PhotoBoothLibraryExclude() -> Bool {
+        let name = "AC-PL6", slug = "migration-v8-photo-booth-library"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/pl6"
+        try? fm.removeItem(atPath: dir)
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        struct Fixture {
+            let id = UUID()
+            let syncMode: String?
+            let localPath: String
+            let filter: String?
+            var shortId: String { String(id.uuidString.prefix(8)).lowercased() }
+        }
+        let withLibrary = "/tmp/synctray-selftest-pl6-with-library"
+        let fixtures: [String: Fixture] = [
+            "bisyncWithLibrary": Fixture(syncMode: "bisync", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "oneWayWithLibrary": Fixture(syncMode: "sync", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "bisyncNoLibrary": Fixture(syncMode: "bisync", localPath: "/tmp/synctray-selftest-pl6-plain", filter: "- .DS_Store\n"),
+            "legacyNoMode": Fixture(syncMode: nil, localPath: withLibrary, filter: "- .DS_Store\n"),
+            "mount": Fixture(syncMode: "mount", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "userRule": Fixture(syncMode: "bisync", localPath: withLibrary, filter: "+ Photo Booth Library/**\n"),
+            "noFilter": Fixture(syncMode: "bisync", localPath: withLibrary, filter: nil),
+        ]
+        for fixture in fixtures.values {
+            var dict: [String: Any] = ["id": fixture.id.uuidString, "name": "PL6", "localSyncPath": fixture.localPath]
+            if let mode = fixture.syncMode { dict["syncMode"] = mode }
+            guard let data = try? JSONSerialization.data(withJSONObject: dict),
+                  (try? data.write(to: URL(fileURLWithPath: "\(dir)/\(fixture.shortId).profile.json"))) != nil else {
+                return report(name, slug, false, "(failed to seed a profile file)")
+            }
+            if let filter = fixture.filter {
+                try? filter.write(toFile: "\(dir)/\(fixture.shortId)-exclude.txt", atomically: true, encoding: .utf8)
+            }
+        }
+        func filter(_ key: String) -> String? {
+            try? String(contentsOfFile: "\(dir)/\(fixtures[key]!.shortId)-exclude.txt", encoding: .utf8)
+        }
+        func hasMarker(_ key: String) -> Bool {
+            fm.fileExists(atPath: "\(dir)/\(fixtures[key]!.shortId).resync-pending")
+        }
+
+        let outcome = MigrationV8PhotoBoothLibraryExclude.addPhotoBoothLibraryExclude(in: dir) { $0 == withLibrary }
+        let expectedUpdated = ["bisyncWithLibrary", "oneWayWithLibrary", "bisyncNoLibrary", "legacyNoMode"]
+            .map { fixtures[$0]!.shortId }.sorted()
+        guard outcome.updated.sorted() == expectedUpdated,
+              outcome.resyncScheduled.sorted() == ["bisyncWithLibrary", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
+              outcome.failed.isEmpty else {
+            return report(name, slug, false, "(unexpected outcome: \(outcome))")
+        }
+        for key in ["bisyncWithLibrary", "oneWayWithLibrary", "bisyncNoLibrary", "legacyNoMode"] {
+            guard let text = filter(key), text.contains(SyncExcludeFilter.DefaultExclude.photoBoothLibrary.rule), text.hasSuffix("- .DS_Store\n") else {
+                return report(name, slug, false, "(\(key) filter did not gain the rule above its own content)")
+            }
+        }
+        guard hasMarker("bisyncWithLibrary"), hasMarker("legacyNoMode"),
+              !hasMarker("oneWayWithLibrary"), !hasMarker("bisyncNoLibrary") else {
+            return report(name, slug, false, "(resync marker written for the wrong profiles)")
+        }
+        guard filter("mount") == "- .DS_Store\n", filter("userRule") == "+ Photo Booth Library/**\n",
+              !hasMarker("mount"), !hasMarker("userRule"),
+              filter("noFilter") == nil else {
+            return report(name, slug, false, "(a Stream profile, a user rule, or a missing filter was touched)")
+        }
+
+        // Idempotent: a second pass changes nothing, including the scheduled token.
+        let markerPath = "\(dir)/\(fixtures["bisyncWithLibrary"]!.shortId).resync-pending"
+        let token = try? String(contentsOfFile: markerPath, encoding: .utf8)
+        let filtersBefore = fixtures.keys.sorted().map { filter($0) }
+        let second = MigrationV8PhotoBoothLibraryExclude.addPhotoBoothLibraryExclude(in: dir) { $0 == withLibrary }
+        guard second == MigrationV8PhotoBoothLibraryExclude.Outcome(),
+              fixtures.keys.sorted().map({ filter($0) }) == filtersBefore,
+              (try? String(contentsOfFile: markerPath, encoding: .utf8)) == token else {
+            return report(name, slug, false, "(a second pass changed something)")
+        }
+
+        // The real bounded walk: found within the depth limit, not past it, not in hidden
+        // folders — and it is a PACKAGE, so the name check must win before the package skip.
+        let tree = "\(selfTestRoot)/pl6-tree"
+        try? fm.removeItem(atPath: tree)
+        try? fm.createDirectory(atPath: "\(tree)/shallow/a/b/Photo Booth Library", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/deep/a/b/c/d/Photo Booth Library", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/hidden/.cache/Photo Booth Library", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/none/a/b", withIntermediateDirectories: true)
+        guard MigrationV8PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/shallow"),
+              !MigrationV8PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/deep"),
+              !MigrationV8PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/hidden"),
+              !MigrationV8PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/none"),
+              !MigrationV8PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/missing") else {
+            return report(name, slug, false, "(containsPhotoBoothLibrary walk gave a wrong answer)")
+        }
+
+        // Write-order pin (plan D3), filter-write-fails side: a 0555 DIRECTORY was tried first
+        // and rejected (pre-push review) — it blocks the marker write too (both are new sibling
+        // files via the same atomic-write pattern), so "no marker" would pass even under a
+        // marker-first order; it only proved a filter failure stops at `failed`, not the order.
+        // Instead, only the FILTER FILE itself is made immutable (`chflags uchg`, macOS's
+        // user-immutable flag — blocks the rename-over-target `String.write(atomically: true)`
+        // needs, even though the directory stays writable). The marker path is a distinct new
+        // file in the same (writable) directory, so only the filter write is forced to fail —
+        // isolating "filter write fails" from "marker write fails" (the rollback case below).
+        // The filter write must fail BEFORE any marker is attempted, so `failed` is recorded and
+        // NO marker file exists at all; if the order were ever flipped to marker-first, the
+        // marker would be written (nothing blocks it here) and this assertion would catch it.
+        let filterFailDir = "\(selfTestRoot)/pl6-filter-fail"
+        try? fm.removeItem(atPath: filterFailDir)
+        try? fm.createDirectory(atPath: filterFailDir, withIntermediateDirectories: true)
+        let ffFixture = Fixture(syncMode: "bisync", localPath: withLibrary, filter: "- .DS_Store\n")
+        let ffDict: [String: Any] = ["id": ffFixture.id.uuidString, "name": "PL6F", "localSyncPath": ffFixture.localPath, "syncMode": "bisync"]
+        guard let ffData = try? JSONSerialization.data(withJSONObject: ffDict),
+              (try? ffData.write(to: URL(fileURLWithPath: "\(filterFailDir)/\(ffFixture.shortId).profile.json"))) != nil else {
+            return report(name, slug, false, "(failed to seed the filter-write-failure fixture)")
+        }
+        let ffFilterPath = "\(filterFailDir)/\(ffFixture.shortId)-exclude.txt"
+        try? "- .DS_Store\n".write(toFile: ffFilterPath, atomically: true, encoding: .utf8)
+        runChflags("uchg", ffFilterPath)
+        let ffOutcome = MigrationV8PhotoBoothLibraryExclude.addPhotoBoothLibraryExclude(in: filterFailDir) { $0 == withLibrary }
+        runChflags("nouchg", ffFilterPath)
+        guard ffOutcome.failed == [ffFixture.shortId], ffOutcome.updated.isEmpty, ffOutcome.resyncScheduled.isEmpty,
+              !fm.fileExists(atPath: "\(filterFailDir)/\(ffFixture.shortId).resync-pending") else {
+            return report(name, slug, false, "(a filter write failure did not record failed with no marker attempted: \(ffOutcome))")
+        }
+
+        let rollbackDir = "\(selfTestRoot)/pl6-rollback"
+        try? fm.removeItem(atPath: rollbackDir)
+        try? fm.createDirectory(atPath: rollbackDir, withIntermediateDirectories: true)
+        let rbFixture = Fixture(syncMode: "bisync", localPath: withLibrary, filter: "- .DS_Store\n")
+        let rbDict: [String: Any] = ["id": rbFixture.id.uuidString, "name": "PL6R", "localSyncPath": rbFixture.localPath, "syncMode": "bisync"]
+        guard let rbData = try? JSONSerialization.data(withJSONObject: rbDict),
+              (try? rbData.write(to: URL(fileURLWithPath: "\(rollbackDir)/\(rbFixture.shortId).profile.json"))) != nil else {
+            return report(name, slug, false, "(failed to seed the rollback fixture)")
+        }
+        let rbFilterPath = "\(rollbackDir)/\(rbFixture.shortId)-exclude.txt"
+        try? "- .DS_Store\n".write(toFile: rbFilterPath, atomically: true, encoding: .utf8)
+        // Make the marker path itself a non-writable directory, so the marker "write" (which
+        // targets a file at that path) throws — the filter write must have already succeeded by
+        // then, and must be rolled back to its pre-migration contents afterward.
+        let rbMarkerPath = "\(rollbackDir)/\(rbFixture.shortId).resync-pending"
+        try? fm.createDirectory(atPath: rbMarkerPath, withIntermediateDirectories: true)
+        let rbOutcome = MigrationV8PhotoBoothLibraryExclude.addPhotoBoothLibraryExclude(in: rollbackDir) { $0 == withLibrary }
+        guard rbOutcome.failed == [rbFixture.shortId], rbOutcome.updated.isEmpty, rbOutcome.resyncScheduled.isEmpty,
+              (try? String(contentsOfFile: rbFilterPath, encoding: .utf8)) == "- .DS_Store\n" else {
+            return report(name, slug, false, "(a marker-write failure did not roll the filter back to its original contents)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DS6 — filterSaveFollowUp returns the right follow-up for every combination
+
+    /// Pure decision matrix (plan D7): a reinstall always wins (`.none`, the agent's own
+    /// `RunAtLoad` starts the sync); otherwise a filter-only change starts Sync Now
+    /// immediately when nothing is running, or asks to confirm stopping the run first when
+    /// something is; no filter change (or nothing installed yet) does nothing further.
+    private static func testFilterSaveFollowUpMatrix() -> Bool {
+        let name = "AC-DS6", slug = "filter-save-follow-up-matrix"
+        let cases: [(filterChanged: Bool, needsReinstall: Bool, runLive: Bool, installed: Bool, expected: FilterSaveFollowUp)] = [
+            (true, false, false, true, .syncNow),
+            (true, false, true, true, .confirmStopThenSync),
+            (true, true, false, true, .none),
+            (true, true, true, true, .none),
+            (false, false, false, true, .none),
+            (false, false, true, true, .none),
+            (true, false, false, false, .none),
+            (true, false, true, false, .none),
+        ]
+        for c in cases {
+            let got = SyncManager.filterSaveFollowUp(
+                filterChanged: c.filterChanged, needsReinstall: c.needsReinstall,
+                runLive: c.runLive, installed: c.installed
+            )
+            guard got == c.expected else {
+                return report(name, slug, false,
+                    "(filterChanged=\(c.filterChanged) needsReinstall=\(c.needsReinstall) runLive=\(c.runLive) "
+                        + "installed=\(c.installed) -> \(got), expected \(c.expected))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DS7 — staging source pins: the banner and the list editor change only form state
+
+    /// Source-text pins for plan D6/D9's staging contract: `stageBlockedPathExclusion` and
+    /// `DontSyncSection`'s pattern editor must change only the form's `@State`/`@Binding`
+    /// `syncExcludePatterns` — never call the retired `updateSyncExcludePatterns`, never write
+    /// the filter file, never trigger a sync — and `hasChanges` must notice a staged pattern
+    /// edit so Save stays unavailable until something actually changed.
+    private static func testStagedDontSyncSourcePins() -> Bool {
+        let name = "AC-DS7", slug = "staged-dont-sync-source-pins"
+        guard let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift") else {
+            return report(name, slug, false, "(could not read ProfileDetailView.swift)")
+        }
+        guard !viewSource.contains("updateSyncExcludePatterns(") else {
+            return report(name, slug, false, "(a call to the retired updateSyncExcludePatterns still exists)")
+        }
+        guard let stageFn = extractFunctionBody(startingAt: "private func stageBlockedPathExclusion()", in: viewSource) else {
+            return report(name, slug, false, "(stageBlockedPathExclusion() not found)")
+        }
+        guard stageFn.contains("syncExcludePatterns.append("),
+              !stageFn.contains("triggerManualSync"),
+              !stageFn.contains("writeExcludeFilter"),
+              !stageFn.contains("clearError") else {
+            return report(name, slug, false, "(stageBlockedPathExclusion does more than stage a pattern)")
+        }
+        // DontSyncSection is a top-level type (its own closing brace sits at column 0), so it is
+        // bounded by hand here rather than via `extractFunctionBody`, which only bounds a
+        // direct member (one level of nesting) and would stop at the first NESTED member's own
+        // 4-space-indented closing brace — far short of the whole struct.
+        let lines = viewSource.components(separatedBy: "\n")
+        guard let sectionStart = lines.firstIndex(where: { $0 == "struct DontSyncSection: View {" }),
+              let sectionEndOffset = lines[sectionStart...].firstIndex(where: { $0 == "}" }) else {
+            return report(name, slug, false, "(DontSyncSection not found)")
+        }
+        let sectionBody = lines[sectionStart...sectionEndOffset].joined(separator: "\n")
+        guard sectionBody.contains("@Binding var patterns: [String]") else {
+            return report(name, slug, false, "(DontSyncSection no longer binds patterns to the form's staged state)")
+        }
+        guard !sectionBody.contains("syncManager.updateSyncExcludePatterns") else {
+            return report(name, slug, false, "(DontSyncSection still writes through SyncManager on every edit)")
+        }
+        guard let hasChangesBody = extractFunctionBody(startingAt: "private var hasChanges: Bool {", in: viewSource),
+              hasChangesBody.contains("syncExcludePatterns != profile.syncExcludePatterns") else {
+            return report(name, slug, false, "(hasChanges does not account for a staged Don't Sync edit)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DS8 — stop-then-sync Save wiring is pinned by source-text assertions
+
+    /// Pins plan D7's Save flow: `applyFilterSaveAndFollowUp` writes the filter and clears the
+    /// error BEFORE the follow-up switch (so "saved == applied on disk" even if an abort gives
+    /// up), `.confirmStopThenSync` goes through `stopRunThenSync` (never a raw `abortSync` call
+    /// from the view), `stopRunThenSync` itself reuses `abortSync`/`abortTasks` with no new
+    /// pause, agent-load/unload, or lock touch (CLAUDE.md Rule 9), and `resumeAfterStopRunThenSync`
+    /// actually honors its own doc comment's claim of re-reading the profile (deleted/disabled
+    /// mid-abort never restarts a sync — pr-reviewer PR #118 finding).
+    private static func testStopThenSyncWiringPinned() -> Bool {
+        let name = "AC-DS8", slug = "stop-then-sync-wiring-pinned"
+        guard let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let managerSource = readSourceFile("Services/SyncManager.swift") else {
+            return report(name, slug, false, "(could not read source files)")
+        }
+        guard let applyFn = extractFunctionBody(
+            startingAt: "private func applyFilterSaveAndFollowUp(current: SyncProfile, updated: SyncProfile, followUp: FilterSaveFollowUp) {",
+            in: viewSource
+        ) else {
+            return report(name, slug, false, "(applyFilterSaveAndFollowUp not found)")
+        }
+        guard let writeRange = applyFn.range(of: "syncManager.applySyncFilterReconcile("),
+              let followUpRange = applyFn.range(of: "switch followUp {"),
+              writeRange.upperBound <= followUpRange.lowerBound else {
+            return report(name, slug, false, "(the filter is not written before the follow-up switch)")
+        }
+        guard applyFn.contains("syncManager.stopRunThenSync(for: updated)"),
+              !applyFn.contains("syncManager.abortSync(") else {
+            return report(name, slug, false, "(confirmStopThenSync does not go through stopRunThenSync)")
+        }
+        guard let stopFn = extractFunctionBody(startingAt: "func stopRunThenSync(for profile: SyncProfile) {", in: managerSource) else {
+            return report(name, slug, false, "(stopRunThenSync not found)")
+        }
+        guard stopFn.contains("abortSync(for: profile)"), stopFn.contains("abortTasks[profile.id]"),
+              !stopFn.contains("pause("), !stopFn.contains("loadAgent"), !stopFn.contains("unloadAgent"),
+              !stopFn.contains("removeStaleLocks"), !stopFn.contains("removeItem") else {
+            return report(name, slug, false, "(stopRunThenSync does more than reuse abortSync/abortTasks)")
+        }
+        guard let resumeFn = extractFunctionBody(
+            startingAt: "private func resumeAfterStopRunThenSync(for profile: SyncProfile) {", in: managerSource
+        ) else {
+            return report(name, slug, false, "(resumeAfterStopRunThenSync not found)")
+        }
+        // The restart must come from a guard that requires BOTH a live lookup (not the stale
+        // `?? profile` fallback) and `isEnabled` — a profile deleted or disabled mid-abort must
+        // never reach `triggerManualSync`.
+        guard resumeFn.contains("guard let latest = profileStore.profile(for: profile.id)"),
+              resumeFn.contains("latest.isEnabled"),
+              !resumeFn.contains("?? profile") else {
+            return report(name, slug, false, "(resumeAfterStopRunThenSync does not guard on a live, enabled profile)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-VS1 — macOS volume system folders are excluded by default, as directory rules
+
+    /// A new filter file carries one `- <name>/**` directory rule per volume system folder and
+    /// no longer the file-only `- .fseventsd`; `addingVolumeSystemFolderDefaults` inserts the
+    /// section below the managed "Don't Sync" block and above the user's own rules, is stable
+    /// under a later `merged`, and changes nothing once every rule is present.
+    private static func testVolumeSystemFolderDefaultExclude() -> Bool {
+        let name = "AC-VS1", slug = "volume-system-folder-default-exclude"
+        let rules = SyncExcludeFilter.volumeSystemFolderRules
+        guard rules.count == SyncExcludeFilter.volumeSystemFolderNames.count,
+              rules.allSatisfy({ $0.hasPrefix("- .") && $0.hasSuffix("/**") }) else {
+            return report(name, slug, false, "(a volume-system-folder rule is not a directory rule: \(rules))")
+        }
+
+        // 1. Defaults written on first create carry every rule, and not the old file-only rule.
+        let dir = "\(selfTestRoot)/vs1"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = "\(dir)/exclude.txt"
+        try? FileManager.default.removeItem(atPath: path)
+        var profile = sampleProfile()
+        profile.syncMode = .sync
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: path)
+        } catch {
+            return report(name, slug, false, "(first write threw: \(error))")
+        }
+        guard let fresh = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return report(name, slug, false, "(could not read the new filter file)")
+        }
+        let freshLines = Set(fresh.components(separatedBy: "\n"))
+        guard rules.allSatisfy({ freshLines.contains($0) }), !freshLines.contains("- .fseventsd"),
+              freshLines.contains(SyncExcludeFilter.photosLibraryRule) else {
+            return report(name, slug, false, "(a new filter file lacks the directory rules or still has `- .fseventsd`)")
+        }
+
+        // 2. Inserted below the managed block, above the user's own rules; stable under merge.
+        let patterns = ["*.bak"]
+        let existing = SyncExcludeFilter.merged(existing: "- .fseventsd\n+ keep/**\n", patterns: patterns)
+        guard let migrated = SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: existing),
+              migrated.hasPrefix(SyncExcludeFilter.beginMarker),
+              let endRange = migrated.range(of: SyncExcludeFilter.endMarker),
+              let ruleRange = migrated.range(of: rules[0]),
+              let includeRange = migrated.range(of: "+ keep/**"),
+              endRange.upperBound <= ruleRange.lowerBound,
+              ruleRange.upperBound <= includeRange.lowerBound,
+              migrated.contains("- *.bak") else {
+            return report(name, slug, false, "(section not placed between the managed block and the user's rules)")
+        }
+        guard SyncExcludeFilter.merged(existing: migrated, patterns: patterns) == migrated else {
+            return report(name, slug, false, "(a later merge with the same patterns rewrote the migrated file)")
+        }
+
+        // 3. Already complete: left alone. Partly present (a user's own rule): completed.
+        guard SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: fresh) == nil,
+              SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: migrated) == nil,
+              SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: "- .Trashes/**\n") != nil,
+              SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: "")
+                == SyncExcludeFilter.volumeSystemFoldersSection + "\n" else {
+            return report(name, slug, false, "(wrong idempotence or empty-file output)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-VS2 — migration v6 adds the rules to existing profiles, once
+
+    /// Every Two-Way and One-Way profile's filter gains the section; only a Two-Way profile whose
+    /// bisync listings hold a system folder gets the resync marker; Stream profiles, missing
+    /// filters and complete filters are untouched; a second pass changes nothing.
+    private static func testMigrationV6VolumeSystemFolders() -> Bool {
+        let name = "AC-VS2", slug = "migration-v6-volume-system-folders"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/vs2"
+        try? fm.removeItem(atPath: dir)
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        struct Fixture {
+            let id = UUID()
+            let syncMode: String?
+            let localPath: String
+            let filter: String?
+            var shortId: String { String(id.uuidString.prefix(8)).lowercased() }
+        }
+        let listedRoot = "/tmp/synctray-selftest-vs2-listed-root"
+        let complete = SyncExcludeFilter.volumeSystemFoldersSection + "\n- .DS_Store\n"
+        let fixtures: [String: Fixture] = [
+            "bisyncListed": Fixture(syncMode: "bisync", localPath: listedRoot, filter: "- .DS_Store\n"),
+            "oneWayListed": Fixture(syncMode: "sync", localPath: listedRoot, filter: "- .DS_Store\n"),
+            "bisyncPlain": Fixture(syncMode: "bisync", localPath: "/tmp/synctray-selftest-vs2-plain", filter: "- .DS_Store\n"),
+            "legacyNoMode": Fixture(syncMode: nil, localPath: listedRoot, filter: "- .DS_Store\n"),
+            "mount": Fixture(syncMode: "mount", localPath: listedRoot, filter: "- .DS_Store\n"),
+            "complete": Fixture(syncMode: "bisync", localPath: listedRoot, filter: complete),
+            "noFilter": Fixture(syncMode: "bisync", localPath: listedRoot, filter: nil),
+        ]
+        for fixture in fixtures.values {
+            var dict: [String: Any] = ["id": fixture.id.uuidString, "name": "VS2", "localSyncPath": fixture.localPath]
+            if let mode = fixture.syncMode { dict["syncMode"] = mode }
+            guard let data = try? JSONSerialization.data(withJSONObject: dict),
+                  (try? data.write(to: URL(fileURLWithPath: "\(dir)/\(fixture.shortId).profile.json"))) != nil else {
+                return report(name, slug, false, "(failed to seed a profile file)")
+            }
+            if let filter = fixture.filter {
+                try? filter.write(toFile: "\(dir)/\(fixture.shortId)-exclude.txt", atomically: true, encoding: .utf8)
+            }
+        }
+        func filter(_ key: String) -> String? {
+            try? String(contentsOfFile: "\(dir)/\(fixtures[key]!.shortId)-exclude.txt", encoding: .utf8)
+        }
+        func hasMarker(_ key: String) -> Bool {
+            fm.fileExists(atPath: "\(dir)/\(fixtures[key]!.shortId).resync-pending")
+        }
+
+        let outcome = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { profile, _ in (profile["localSyncPath"] as? String) == listedRoot }
+        let updatedKeys = ["bisyncListed", "oneWayListed", "bisyncPlain", "legacyNoMode"]
+        guard outcome.updated.sorted() == updatedKeys.map({ fixtures[$0]!.shortId }).sorted(),
+              outcome.resyncScheduled.sorted() == ["bisyncListed", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
+              outcome.failed.isEmpty else {
+            return report(name, slug, false, "(unexpected outcome: \(outcome))")
+        }
+        for key in updatedKeys {
+            guard let text = filter(key), text.contains(SyncExcludeFilter.volumeSystemFoldersSection),
+                  text.hasSuffix("- .DS_Store\n") else {
+                return report(name, slug, false, "(\(key) filter did not gain the section above its own content)")
+            }
+        }
+        guard hasMarker("bisyncListed"), hasMarker("legacyNoMode"),
+              !hasMarker("oneWayListed"), !hasMarker("bisyncPlain"),
+              filter("mount") == "- .DS_Store\n", !hasMarker("mount"),
+              filter("complete") == complete, !hasMarker("complete"),
+              filter("noFilter") == nil else {
+            return report(name, slug, false, "(a marker or filter changed for the wrong profile)")
+        }
+
+        let filtersBefore = fixtures.keys.sorted().map { filter($0) }
+        let second = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { profile, _ in (profile["localSyncPath"] as? String) == listedRoot }
+        guard second == MigrationV6VolumeSystemFoldersExclude.Outcome(),
+              fixtures.keys.sorted().map({ filter($0) }) == filtersBefore else {
+            return report(name, slug, false, "(a second pass changed something)")
+        }
+
+        // The real check reads the listings of exactly the sessions the sync script runs: the
+        // primary, and a fallback's own session only when it swaps the whole remote. A listed
+        // system folder counts at any depth, in either listing, under the stored or the
+        // `~`-expanded folder. A leftover session, a transport-override fallback's (it shares the
+        // primary's), another folder with the same canonical name, a `.lst-new` and a missing
+        // cache don't.
+        let work = "\(selfTestRoot)/vs2-bisync"
+        try? fm.removeItem(atPath: work)
+        try? fm.createDirectory(atPath: work, withIntermediateDirectories: true)
+        let header = "# bisync listing v1 from 2026-10-19T05:47:08.596618000+0000\n"
+        func listing(_ remote: String, _ local: String, _ side: String, _ paths: [String], suffix: String = "") {
+            let body = paths.map { "-       36 - - 2026-10-18T01:12:35.000000000+0000 \"\($0)\"" }.joined(separator: "\n")
+            let file = "\(work)/\(SyncSetupService.bisyncSessionName(remote: remote, localPath: local)).\(side).lst\(suffix)"
+            try? (header + body + "\n").write(toFile: file, atomically: true, encoding: .utf8)
+        }
+        // Every case but the fallback ones has no fallback, so the derived config doesn't matter.
+        func lists(_ profile: [String: Any], derived: [String: Any]? = nil) -> Bool {
+            VolumeSystemFolderListings.containSystemFolder(profile: profile, derivedConfig: derived, workDir: work)
+        }
+        let tildeLocal = "~/SelfTestVS2 Drive"
+        listing("nas:Kaiju", "/Volumes/Kaiju", "path1", ["Config/a.zip", ".fseventsd/fseventsd-uuid"])
+        listing("nas:Kaiju", "/Volumes/Kaiju", "path2", ["Config/a.zip"])
+        listing("nas:Nested", "/Volumes/Nested", "path2", ["Projects/disk/.Trashes/501/x"])
+        listing("nas:Tilde", (tildeLocal as NSString).expandingTildeInPath, "path1", [".Spotlight-V100/Store-V2/x"])
+        listing("nas:Plain", "/Volumes/Plain", "path1", ["Config/a.zip", "notes/.fseventsd-like.txt"])
+        listing("nas:Partial", "/Volumes/Partial", "path1", [".TemporaryItems/x"], suffix: "-new")
+        // Plain's session is clean, but a session from a fallback it no longer has is not.
+        listing("old-sftp:Plain", "/Volumes/Plain", "path1", [".fseventsd/x"])
+        // `My Work` and `My_Work` canonicalize alike; only the remote half tells them apart.
+        listing("nas:Other", "/Volumes/My_Work", "path1", [".fseventsd/x"])
+        listing("sftp:Swap", "/Volumes/Swap", "path1", [".Trashes/x"])
+        guard lists(["rcloneRemote": "nas", "remotePath": "Kaiju", "localSyncPath": "/Volumes/Kaiju"]),
+              lists(["rcloneRemote": "nas:", "remotePath": "Kaiju", "localSyncPath": "/Volumes/Kaiju/"]),
+              lists(["rcloneRemote": "nas", "remotePath": "Nested", "localSyncPath": "/Volumes/Nested"]),
+              lists(["rcloneRemote": "nas", "remotePath": "Tilde", "localSyncPath": tildeLocal]),
+              !lists(["rcloneRemote": "nas", "remotePath": "Plain", "localSyncPath": "/Volumes/Plain"]),
+              !lists(["rcloneRemote": "nas", "remotePath": "Partial", "localSyncPath": "/Volumes/Partial"]),
+              !lists(["rcloneRemote": "nas", "remotePath": "Work", "localSyncPath": "/Volumes/My Work"]),
+              !lists(["rcloneRemote": "nas", "remotePath": "Missing", "localSyncPath": "/Volumes/Missing"]),
+              !lists(["rcloneRemote": "nas", "localSyncPath": ""]),
+              !VolumeSystemFolderListings.containSystemFolder(
+                  profile: ["rcloneRemote": "nas", "remotePath": "Kaiju", "localSyncPath": "/Volumes/Kaiju"],
+                  derivedConfig: nil, workDir: "\(work)/absent") else {
+            return report(name, slug, false, "(VolumeSystemFolderListings gave a wrong answer)")
+        }
+        // The fallback's own session counts only when it swaps the whole remote reference, as the
+        // script decides it: from the derived config's `fallbackRequiresCacheRebuild` (the stored
+        // one is never computed, so it is ignored) or a fallback path; with no derived config,
+        // any fallback counts.
+        let swap: [String: Any] = ["rcloneRemote": "nas", "remotePath": "Swap", "localSyncPath": "/Volumes/Swap",
+                                   "fallbackRemote": "sftp", "fallbackRequiresCacheRebuild": true]
+        let derived: [String: Any] = ["remote": "nas:Swap", "remotePath": "Swap", "localPath": "/Volumes/Swap",
+                                      "fallbackRemote": "sftp", "fallbackRemotePath": "", "fallbackRequiresCacheRebuild": false]
+        var derivedRebuild = derived; derivedRebuild["fallbackRequiresCacheRebuild"] = true
+        var derivedPath = derived; derivedPath["fallbackRemotePath"] = "Swap"
+        guard !lists(swap, derived: derived), lists(swap, derived: derivedRebuild), lists(swap, derived: derivedPath),
+              lists(swap, derived: nil),
+              VolumeSystemFolderListings.sessionNames(profile: swap, derivedConfig: derived)
+                == [SyncSetupService.bisyncSessionName(remote: "nas:Swap", localPath: "/Volumes/Swap")] else {
+            return report(name, slug, false, "(the fallback session was counted under the wrong condition)")
+        }
+        // The derived config is read from beside the profile file.
+        try? (try? JSONSerialization.data(withJSONObject: derivedRebuild))?.write(to: URL(fileURLWithPath: "\(work)/abcd1234.json"))
+        guard (VolumeSystemFolderListings.derivedConfig(shortId: "abcd1234", in: work)?["fallbackRequiresCacheRebuild"] as? Bool) == true,
+              VolumeSystemFolderListings.derivedConfig(shortId: "missing0", in: work) == nil else {
+            return report(name, slug, false, "(derivedConfig did not read the derived config)")
+        }
+        guard VolumeSystemFolderListings.listedPath(in: header.dropLast()) == nil,
+              VolumeSystemFolderListings.listedPath(in: "") == nil,
+              VolumeSystemFolderListings.listedPath(in: "- 1 - - 2026 \"a b/c\"") == "a b/c" else {
+            return report(name, slug, false, "(listedPath parsed a line wrong)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-VS5 — migration v7 schedules the resync the first v6 missed, from the listings
+
+    /// After the first v6 (which looked at the drive, so missed an unplugged one): a Two-Way
+    /// profile whose filter has every volume rule, no marker, and listings that hold a system
+    /// folder gets a marker. A pending marker is kept as it is; a One-Way, Stream, unlisted or
+    /// not-yet-migrated profile gets none; a second pass changes nothing.
+    private static func testMigrationV7VolumeSystemFolderResync() -> Bool {
+        let name = "AC-VS5", slug = "migration-v7-volume-system-folder-resync"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/vs5"
+        try? fm.removeItem(atPath: dir)
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        struct Fixture {
+            let id = UUID()
+            let syncMode: String?
+            let localPath: String
+            let filter: String?
+            var marker: String? = nil
+            var shortId: String { String(id.uuidString.prefix(8)).lowercased() }
+        }
+        let listed = "/Volumes/SelfTestVS5Listed"
+        let migrated = SyncExcludeFilter.volumeSystemFoldersSection + "\n- .DS_Store\n"
+        let fixtures: [String: Fixture] = [
+            "unpluggedAtV6": Fixture(syncMode: "bisync", localPath: listed, filter: migrated),
+            "legacyNoMode": Fixture(syncMode: nil, localPath: listed, filter: migrated),
+            "pending": Fixture(syncMode: "bisync", localPath: listed, filter: migrated, marker: "include-edit-token"),
+            "notListed": Fixture(syncMode: "bisync", localPath: "/Volumes/SelfTestVS5Plain", filter: migrated),
+            "oneWay": Fixture(syncMode: "sync", localPath: listed, filter: migrated),
+            "mount": Fixture(syncMode: "mount", localPath: listed, filter: migrated),
+            "notMigrated": Fixture(syncMode: "bisync", localPath: listed, filter: "- .DS_Store\n"),
+            "noFilter": Fixture(syncMode: "bisync", localPath: listed, filter: nil),
+        ]
+        func markerPath(_ key: String) -> String { "\(dir)/\(fixtures[key]!.shortId).resync-pending" }
+        for fixture in fixtures.values {
+            var dict: [String: Any] = ["id": fixture.id.uuidString, "name": "VS5", "localSyncPath": fixture.localPath]
+            if let mode = fixture.syncMode { dict["syncMode"] = mode }
+            guard let data = try? JSONSerialization.data(withJSONObject: dict),
+                  (try? data.write(to: URL(fileURLWithPath: "\(dir)/\(fixture.shortId).profile.json"))) != nil else {
+                return report(name, slug, false, "(failed to seed a profile file)")
+            }
+            if let filter = fixture.filter {
+                try? filter.write(toFile: "\(dir)/\(fixture.shortId)-exclude.txt", atomically: true, encoding: .utf8)
+            }
+            if let marker = fixture.marker {
+                try? marker.write(toFile: "\(dir)/\(fixture.shortId).resync-pending", atomically: true, encoding: .utf8)
+            }
+        }
+        let filtersBefore = fixtures.keys.sorted().map { try? String(contentsOfFile: "\(dir)/\(fixtures[$0]!.shortId)-exclude.txt", encoding: .utf8) }
+
+        let outcome = MigrationV7VolumeSystemFolderResyncFromListings.scheduleResyncs(in: dir) { profile, _ in (profile["localSyncPath"] as? String) == listed }
+        guard outcome.resyncScheduled.sorted() == ["unpluggedAtV6", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
+              outcome.failed.isEmpty else {
+            return report(name, slug, false, "(unexpected outcome: \(outcome))")
+        }
+        guard fm.fileExists(atPath: markerPath("unpluggedAtV6")), fm.fileExists(atPath: markerPath("legacyNoMode")),
+              (try? String(contentsOfFile: markerPath("pending"), encoding: .utf8)) == "include-edit-token",
+              ["notListed", "oneWay", "mount", "notMigrated", "noFilter"].allSatisfy({ !fm.fileExists(atPath: markerPath($0)) }) else {
+            return report(name, slug, false, "(a marker was written, kept or replaced for the wrong profile)")
+        }
+        guard fixtures.keys.sorted().map({ try? String(contentsOfFile: "\(dir)/\(fixtures[$0]!.shortId)-exclude.txt", encoding: .utf8) }) == filtersBefore else {
+            return report(name, slug, false, "(v7 edited a filter)")
+        }
+        let tokenBefore = try? String(contentsOfFile: markerPath("unpluggedAtV6"), encoding: .utf8)
+        let second = MigrationV7VolumeSystemFolderResyncFromListings.scheduleResyncs(in: dir) { profile, _ in (profile["localSyncPath"] as? String) == listed }
+        guard second == MigrationV7VolumeSystemFolderResyncFromListings.Outcome(),
+              (try? String(contentsOfFile: markerPath("unpluggedAtV6"), encoding: .utf8)) == tokenBefore else {
+            return report(name, slug, false, "(a second pass changed something)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-VS3 — real rclone: the defaults keep it out of unreadable system folders
+
+    /// A sync folder shaped like an external volume root, with UNREADABLE `.fseventsd`,
+    /// `.Spotlight-V100` and `.Trashes`, and no "Sync Only These Folders" entries. With the
+    /// default filter the REAL `rclone lsf` lists the user's files and exits 0; with the old
+    /// default's file-only `- .fseventsd` it exits non-zero on "permission denied" — the
+    /// control that proves the folders really were unreadable (skipped as root).
+    private static func testVolumeSystemFoldersRealRclone() -> Bool {
+        let name = "AC-VS3", slug = "volume-system-folders-real-rclone"
+        guard let rclone = RcloneLocator.resolve() else {
+            return report(name, slug, false, "(rclone not found on PATH)")
+        }
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/vs3-\(UUID().uuidString)"
+        let systemFolders = [".fseventsd", ".Spotlight-V100", ".Trashes"]
+        for rel in ["Docs/a.txt"] + systemFolders.map({ "\($0)/inside" }) {
+            let full = "\(dir)/\(rel)"
+            try? fm.createDirectory(atPath: (full as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            try? "x".write(toFile: full, atomically: true, encoding: .utf8)
+        }
+        for folder in systemFolders {
+            try? fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: "\(dir)/\(folder)")
+        }
+        defer {
+            for folder in systemFolders {
+                try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: "\(dir)/\(folder)")
+            }
+        }
+
+        func lsf(filterPath: String) -> (status: Int32, listed: Set<String>)? {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: rclone)
+            proc.arguments = ["lsf", "-R", "--files-only", "--filter-from", filterPath, dir]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = FileHandle.nullDevice
+            guard (try? proc.run()) != nil else { return nil }
+            proc.waitUntilExit()
+            let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            return (proc.terminationStatus, Set(output.split(separator: "\n").map(String.init)))
+        }
+
+        let filterPath = "\(dir)-exclude.txt"
+        var profile = sampleProfile(name: "VS3")
+        profile.syncMode = .sync
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: filterPath)
+        } catch {
+            return report(name, slug, false, "(writeExcludeFilter threw: \(error))")
+        }
+        guard let fixed = lsf(filterPath: filterPath) else {
+            return report(name, slug, false, "(could not run rclone lsf)")
+        }
+        guard fixed.status == 0, fixed.listed == ["Docs/a.txt"] else {
+            return report(name, slug, false, "(default filter: rclone lsf exited \(fixed.status), listed \(fixed.listed))")
+        }
+
+        if getuid() != 0 {
+            let oldFilterPath = "\(dir)-old-exclude.txt"
+            try? "- ._*\n- .DS_Store\n- .fseventsd\n".write(toFile: oldFilterPath, atomically: true, encoding: .utf8)
+            guard let old = lsf(filterPath: oldFilterPath), old.status != 0 else {
+                return report(name, slug, false, "(control: the old `- .fseventsd` default did not fail — folders not unreadable?)")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-VS4 — "permission denied" on a local path gets the blocked-access handling
+
+    /// rclone's real EACCES line for a root-owned system folder is recognized as a LOCAL
+    /// permissions denial inside the sync folder (kept whole by `LogParser`, summarized without
+    /// promising privacy settings, excludable), stays `error.type=permission_denied`, and gets
+    /// bounded `error.access_denial` / `error.blocked_path.*` attributes, never the path. The
+    /// banner offers Open Privacy Settings only for an EPERM denial, and migration v6 is
+    /// registered after v5.
+    private static func testPermissionDeniedBlockedAccess() -> Bool {
+        let name = "AC-VS4", slug = "permission-denied-blocked-access"
+        let root = "/Volumes/Some Drive"
+        let folder = "\(root)/.Spotlight-V100"
+        let message = "failed to open directory \".Spotlight-V100\": open \(folder): permission denied"
+
+        guard let blocked = SyncLogPatterns.blockedAccess(in: message),
+              blocked.path == folder, blocked.kind == .filePermissions,
+              SyncLogPatterns.isPermissionDenied(message),
+              SyncLogPatterns.operationNotPermittedPath(in: message) == nil,
+              SyncLogPatterns.macOSBlockedPath(in: message, localSyncPath: root) == folder,
+              SyncLogPatterns.macOSBlockedPath(in: message, localSyncPath: "/Volumes/Other") == nil,
+              SyncLogPatterns.macOSBlockedAccessSummary(for: message, localSyncPath: root)
+                == "SyncTray doesn't have permission to access “.Spotlight-V100”.",
+              SyncExcludeFilter.excludePattern(forBlockedPath: folder, localSyncPath: root, isDirectory: true)
+                == "/.Spotlight-V100/" else {
+            return report(name, slug, false, "(the EACCES line was not recognized as a local permissions denial)")
+        }
+        let eperm = "failed to open directory \"P.photoslibrary\": open \(root)/P.photoslibrary: operation not permitted"
+        guard SyncLogPatterns.blockedAccess(in: eperm)?.kind == .macOSPrivacy,
+              SyncLogPatterns.macOSBlockedAccessSummary(for: eperm, localSyncPath: root)
+                == "macOS blocked access to “P.photoslibrary”." else {
+            return report(name, slug, false, "(the EPERM case changed)")
+        }
+
+        // LogParser keeps a deep EACCES path whole.
+        let deepFolder = root + "/" + String(repeating: "A Very Long Folder Name/", count: 10) + "Locked"
+        let deepMessage = "failed to open directory \"Locked\": open \(deepFolder): permission denied"
+        let dict: [String: Any] = ["level": "error", "msg": deepMessage, "source": "local/local.go:689",
+                                   "time": "2026-10-19T07:12:38.48317+02:00"]
+        guard let lineData = try? JSONSerialization.data(withJSONObject: dict),
+              let event = LogParser().parse(line: String(decoding: lineData, as: UTF8.self)),
+              case .errorMessage(let kept) = event.type,
+              SyncLogPatterns.macOSBlockedPath(in: kept, localSyncPath: root) == deepFolder else {
+            return report(name, slug, false, "(LogParser cut the path off a long permissions denial)")
+        }
+
+        // Telemetry: the bucket is unchanged; the attributes are bounded and carry no path.
+        guard TelemetryService.categorizeError(message) == "permission_denied",
+              TelemetryService.categorizeError(eperm) == "permission_denied" else {
+            return report(name, slug, false, "(error.type changed for a permission error)")
+        }
+        let attrs = TelemetryService.accessDenialAttributes(for: message, localSyncPath: root)
+        guard attrs["error.access_denial"] == .string("permission_denied"),
+              attrs["error.blocked_path.kind"] == .string("volume_system_folder"),
+              attrs["error.blocked_path.in_sync_folder"] == .bool(true),
+              TelemetryService.accessDenialAttributes(for: eperm, localSyncPath: root)["error.access_denial"]
+                == .string("operation_not_permitted"),
+              TelemetryService.accessDenialAttributes(for: eperm, localSyncPath: root)["error.blocked_path.kind"]
+                == .string("photos_library"),
+              TelemetryService.accessDenialAttributes(for: message, localSyncPath: "/Users/me/Elsewhere")["error.blocked_path.in_sync_folder"]
+                == .bool(false),
+              TelemetryService.accessDenialAttributes(for: "Failed to copy: permission denied", localSyncPath: root)
+                == ["error.access_denial": .string("permission_denied")],
+              TelemetryService.accessDenialAttributes(for: "something unexpected happened", localSyncPath: root).isEmpty,
+              TelemetryService.accessDenialAttributes(for: nil, localSyncPath: root).isEmpty else {
+            return report(name, slug, false, "(wrong access-denial attributes)")
+        }
+        let allValues = (attrs.values.map { "\($0)" }).joined(separator: " ")
+        guard !allValues.contains("/Volumes"), !allValues.contains("Some Drive") else {
+            return report(name, slug, false, "(an access-denial attribute carried the path)")
+        }
+
+        // Source pins.
+        guard let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let migrationSource = readSourceFile("Services/MigrationRunner.swift"),
+              let managerSource = readSourceFile("Services/SyncManager.swift") else {
+            return report(name, slug, false, "(could not read source files)")
+        }
+        guard let actions = extractFunctionBody(startingAt: "private func macOSBlockedAccessActions(", in: viewSource),
+              let gate = actions.range(of: "if kind == .macOSPrivacy {"),
+              let privacy = actions.range(of: "handleErrorAction(.openPrivacySettings)"),
+              gate.upperBound <= privacy.lowerBound else {
+            return report(name, slug, false, "(Open Privacy Settings is offered for a permissions denial)")
+        }
+        guard migrationSource.contains("MigrationV5PhotosLibraryExclude(),\n        MigrationV6VolumeSystemFoldersExclude(),") else {
+            return report(name, slug, false, "(migration v6 is not registered after v5)")
+        }
+        guard managerSource.contains("errorMessage: profileErrors[profileId] ?? message,\n                localSyncPath: profile?.localSyncPath"),
+              managerSource.contains("errorMessage: message,\n                localSyncPath: profile?.localSyncPath") else {
+            return report(name, slug, false, "(telemetry is not given the profile's local folder)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS1 — telemetry lock state tells a verified run from a reused PID
+
+    /// `SyncRunLock.lockState` maps every holder to its bounded `sync.lock_state` label, and
+    /// only a live PID that `SyncAbort.isProfileProcess` recognises as this profile's run is
+    /// `live_verified` — a PID reused by another profile's script is `live_unverified`, the
+    /// stuck-lock signature `kill(pid, 0)` alone can't see. `isProfileProcess` accepts the
+    /// script by its config path and an rclone by its local folder (raw or `~`-expanded,
+    /// whatever its parent), and nothing without a command line.
+    private static func testTelemetryLockState() -> Bool {
+        let name = "AC-TS1", slug = "telemetry-lock-state"
+        let appPID: Int32 = 500
+        let alivePIDs: Set<Int32> = [500, 700, 701, 900, 950]
+        let isAlive: (Int32) -> Bool = { alivePIDs.contains($0) }
+        let configPath = "/Users/me/.config/synctray/profiles/c6169dcc.json"
+        let otherConfigPath = "/Users/me/.config/synctray/profiles/0badf00d.json"
+        let localSyncPath = "/Users/me/Sync"
+        let bash700 = SyncAbort.ProcessEntry(pid: 700, ppid: 1, name: "/bin/bash")
+        let rclone701 = SyncAbort.ProcessEntry(pid: 701, ppid: 700, name: "/opt/homebrew/bin/rclone")
+        let bash900 = SyncAbort.ProcessEntry(pid: 900, ppid: 1, name: "/bin/bash")
+        let table: [Int32: SyncAbort.ProcessEntry] = [700: bash700, 701: rclone701, 900: bash900]
+        let arguments: [Int32: String] = [
+            700: "/bin/bash /Users/me/.local/bin/synctray-sync.sh \(configPath)",
+            701: "/opt/homebrew/bin/rclone bisync remote:Sync \(localSyncPath) --verbose --use-json-log",
+            // The lock's PID was reused by ANOTHER profile's sync script.
+            900: "/bin/bash /Users/me/.local/bin/synctray-sync.sh \(otherConfigPath)",
+        ]
+        let identify: (Int32) -> Bool = { pid in
+            guard let entry = table[pid] else { return false }
+            return SyncAbort.isProfileProcess(
+                entry, arguments: arguments[pid], configPath: configPath, localSyncPath: localSyncPath)
+        }
+        func state(_ holder: SyncRunLock.Holder) -> String {
+            SyncRunLock.lockState(holder: holder, appPID: appPID, isAlive: isAlive, identify: identify)
+        }
+        let cases: [(SyncRunLock.Holder, String)] = [
+            (SyncRunLock.Holder.none, "none"),
+            (SyncRunLock.parseHolder(nil), "none"),
+            (SyncRunLock.parseHolder("  \n"), "none"),
+            (SyncRunLock.Holder.pending, "pending"),
+            (SyncRunLock.parseHolder("pending"), "pending"),
+            (SyncRunLock.Holder.unreadable, "unreadable"),
+            (SyncRunLock.parseHolder("not a pid"), "unreadable"),
+            (SyncRunLock.Holder.pid(0), "unreadable"),
+            (SyncRunLock.Holder.pid(4242), "stale"),
+            (SyncRunLock.Holder.pid(500), "live_app"),
+            (SyncRunLock.Holder.pid(700), "live_verified"),
+            (SyncRunLock.parseHolder(#"{"Session":"x","PID":"701"}"#), "live_verified"),
+            (SyncRunLock.Holder.pid(900), "live_unverified"),
+            // Alive, but not in the process table (or ps failed): never verified.
+            (SyncRunLock.Holder.pid(950), "live_unverified"),
+        ]
+        for (holder, expected) in cases {
+            let got = state(holder)
+            guard got == expected else {
+                return report(name, slug, false, "(lockState(\(holder)) = \(got), expected \(expected))")
+            }
+        }
+        // `identify` decides only between the two live labels: never for the app's own
+        // placeholder, never for a dead PID.
+        let alwaysYes: (Int32) -> Bool = { _ in true }
+        guard SyncRunLock.lockState(holder: .pid(500), appPID: appPID, isAlive: isAlive, identify: alwaysYes) == "live_app",
+              SyncRunLock.lockState(holder: .pid(4242), appPID: appPID, isAlive: isAlive, identify: alwaysYes) == "stale" else {
+            return report(name, slug, false, "(identify overrode live_app or stale)")
+        }
+
+        // isProfileProcess positives.
+        let scriptEntry = SyncAbort.ProcessEntry(pid: 710, ppid: 1, name: "/Users/me/.local/bin/synctray-sync.sh")
+        let tildeLocal = "~/SelfTestTS1Sync"
+        let expandedLocal = (tildeLocal as NSString).expandingTildeInPath
+        guard SyncAbort.isProfileProcess(bash700, arguments: arguments[700], configPath: configPath, localSyncPath: localSyncPath),
+              SyncAbort.isProfileProcess(scriptEntry, arguments: "synctray-sync.sh \(configPath)",
+                                         configPath: configPath, localSyncPath: localSyncPath),
+              SyncAbort.isProfileProcess(rclone701, arguments: arguments[701], configPath: configPath, localSyncPath: localSyncPath),
+              SyncAbort.isProfileProcess(rclone701, arguments: "rclone sync \(expandedLocal) remote:x",
+                                         configPath: configPath, localSyncPath: tildeLocal),
+              SyncAbort.isProfileProcess(rclone701, arguments: "rclone sync \(tildeLocal) remote:x",
+                                         configPath: configPath, localSyncPath: tildeLocal),
+              SyncAbort.isProfileProcess(rclone701, arguments: arguments[701], configPath: configPath,
+                                         localSyncPath: localSyncPath + "/") else {
+            return report(name, slug, false, "(isProfileProcess rejected one of this profile's run processes)")
+        }
+        // Unlike isRunRoot, a script run's rclone (parent = bash, not the app) still qualifies.
+        guard !SyncAbort.isRunRoot(rclone701, arguments: arguments[701], appPID: appPID,
+                                   configPath: configPath, localSyncPath: localSyncPath) else {
+            return report(name, slug, false, "(fixture assumption broken: isRunRoot accepted a non-app-child rclone)")
+        }
+
+        // isProfileProcess negatives.
+        let zsh = SyncAbort.ProcessEntry(pid: 720, ppid: 1, name: "/bin/zsh")
+        guard !SyncAbort.isProfileProcess(bash900, arguments: arguments[900], configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(zsh, arguments: "zsh -c synctray-sync.sh \(configPath)",
+                                          configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync remote:Other /Users/me/Other --verbose",
+                                          configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync remote:Sync2 /Users/me/Sync2 --verbose",
+                                          configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: nil, configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(bash700, arguments: nil, configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: arguments[701], configPath: configPath, localSyncPath: "") else {
+            return report(name, slug, false, "(isProfileProcess accepted a process that is not this profile's run)")
+        }
+
+        // The folder must be a whole argument: another profile's rclone syncing a folder INSIDE
+        // this one, or — for a profile syncing the home folder — any SyncTray rclone, whose
+        // `--filter-from ~/.config/synctray/profiles/…` starts with the home path, is not ours.
+        let homeProfileFolder = "/Users/me"
+        let otherProfileRclone = "rclone bisync /Users/me/Pictures gdrive:Pictures --filter-from /Users/me/.config/synctray/profiles/abcd1234-exclude.txt"
+        guard !SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync remote:Photos /Users/me/Sync/Photos --verbose",
+                                          configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: otherProfileRclone,
+                                          configPath: configPath, localSyncPath: homeProfileFolder) else {
+            return report(name, slug, false, "(isProfileProcess accepted an rclone for a folder inside or under this profile's)")
+        }
+        guard SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync gdrive:Home /Users/me --verbose --filter-from /Users/me/.config/synctray/profiles/c6169dcc-exclude.txt",
+                                         configPath: configPath, localSyncPath: homeProfileFolder),
+              SyncAbort.isProfileProcess(rclone701, arguments: "rclone sync /Users/me/ gdrive:Home",
+                                         configPath: configPath, localSyncPath: homeProfileFolder) else {
+            return report(name, slug, false, "(isProfileProcess rejected an rclone whose argument is exactly this profile's home folder)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS2 — error categories: the new buckets, the old ones unchanged, and error.operation
+
+    private static func testTelemetryErrorCategories() -> Bool {
+        let name = "AC-TS2", slug = "telemetry-error-categories"
+        let photosDenial = "failed to open directory \"Photos Library.photoslibrary\": open /Users/someone/Pictures/Photos Library.photoslibrary: operation not permitted"
+        let checks: [(String?, String)] = [
+            // New buckets, from real rclone / Google Drive / Go runtime wording.
+            ("Failed to copy: googleapi: Error 403: User Rate Limit Exceeded. Rate of requests for user exceed configured project quota., userRateLimitExceeded", "rate_limited"),
+            ("googleapi: Error 403: Quota exceeded for quota metric 'Queries' and limit 'Queries per minute per user', rateLimitExceeded", "rate_limited"),
+            ("HTTP error 429 (429 Too Many Requests) returned body: \"slow down\"", "rate_limited"),
+            ("Failed to copy: googleapi: Error 403: The user's Drive storage quota has been exceeded., storageQuotaExceeded", "quota_exceeded"),
+            ("Failed to copy: 507 Insufficient Storage", "quota_exceeded"),
+            ("Failed to copy: write /Users/me/Sync/big.mov: no space left on device", "disk_full"),
+            ("Failed to create file system for \"gdrive:\": couldn't fetch token: invalid_grant: maybe token expired? - try refreshing with \"rclone config reconnect gdrive:\"", "auth_failed"),
+            ("oauth2: cannot fetch token: 400 Bad Request", "auth_failed"),
+            ("Failed to copy: HTTP 401 Unauthorized", "auth_failed"),
+            ("Get \"https://nas.local:5006/\": tls: failed to verify certificate: x509: certificate signed by unknown authority", "tls_certificate"),
+            ("Failed to copy: open /Users/me/Sync/aaaaaaaa: file name too long", "name_too_long"),
+            ("Failed to copy: invalidRequest: The provided name contains invalid characters", "invalid_name"),
+            ("Failed to copy: corrupted on transfer: md5 hash differ \"0cc1\" vs \"9f2e\"", "checksum_mismatch"),
+            ("Failed to copy: corrupted on transfer: sizes differ 1024 vs 2048", "checksum_mismatch"),
+            ("Failed to copy: can't copy - source file is being updated (size changed from 1024 to 2048)", "file_changed_during_transfer"),
+            ("Failed to copy: open /Users/me/Sync/library.sqlite: resource busy", "file_busy"),
+            ("Duplicate object found in source - ignoring", "duplicate_object"),
+            ("Duplicate directory found in destination - ignoring", "duplicate_object"),
+            ("Failed to rmdir: remove /Users/me/Sync/old: directory not empty", "directory_not_empty"),
+            // More network / timeout phrasings.
+            ("Failed to copy: Post \"https://www.googleapis.com/upload\": dial tcp: lookup www.googleapis.com: no such host", "network"),
+            ("Failed to copy: read tcp 10.0.0.2:52311->142.250.0.1:443: read: connection reset by peer", "network"),
+            ("Failed to copy: write tcp 10.0.0.2:52311->10.0.0.5:445: write: broken pipe", "network"),
+            ("Failed to copy: Get \"https://www.googleapis.com/drive/v3/files\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)", "timeout"),
+            // Moved by this PR: a bare "no such host" was file_not_found (via "no such").
+            ("no such host", "network"),
+            // A token refresh that timed out is a timeout, not an auth failure ("oauth2:" /
+            // "failed to refresh token" must not win over the timeout wording).
+            ("oauth2: cannot fetch token: Post \"https://oauth2.googleapis.com/token\": dial tcp 1.2.3.4:443: i/o timeout", "timeout"),
+            ("oauth2: cannot fetch token: Post \"https://oauth2.googleapis.com/token\": net/http: TLS handshake timeout", "timeout"),
+            ("failed to refresh token: Post \"https://api.proton.me/auth/refresh\": dial tcp 1.2.3.4:443: connect: operation timed out", "timeout"),
+            // Go's JSON decoder on an HTML reply (e.g. a captive portal or proxy) is not a bad
+            // file name.
+            ("failed to get StartPageToken: invalid character '<' looking for beginning of value", "other"),
+            // A file merely named x509 is not a TLS error.
+            ("open /Users/me/Sync/certs/x509.pem: no such file or directory", "file_not_found"),
+            // A path segment named tls or x509 is not a TLS error either ("/" precedes it, not a space)…
+            ("open /Users/me/Sync/certs/tls: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/certs/x509: no such file or directory", "file_not_found"),
+            ("open /Users/me/Sync/x/oauth2: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/Duplicate Files/a.jpg: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/Bad Certificate.pdf: permission denied", "permission_denied"),
+            // Nor is a file whose name merely contains an HTTP status phrase.
+            ("open /Users/me/Sync/Unauthorized.pdf: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/rate limit notes.txt: no such file or directory", "file_not_found"),
+            // …while Go's prefixes still match mid-message and at the very start of the message.
+            ("tls: first record does not look like a TLS handshake", "tls_certificate"),
+            ("x509: certificate is valid for nas.local, not nas.example.com", "tls_certificate"),
+            ("remote error: tls: bad certificate", "tls_certificate"),
+            // Unchanged buckets.
+            (photosDenial, "permission_denied"),
+            ("Failed to sync with 2 errors: last error was: not deleting files as there were IO errors", "io_errors_blocked_deletes"),
+            ("file not found", "file_not_found"),
+            ("Failed to copy: permission denied", "permission_denied"),
+            // A file name that merely mentions a certificate is not a TLS error.
+            ("open /Users/me/Sync/Birth Certificate.pdf: permission denied", "permission_denied"),
+            ("dial tcp 10.0.0.5:445: i/o timeout", "timeout"),
+            ("network error", "network"),
+            ("Bisync critical error: out of sync - must run --resync", "out_of_sync"),
+            // rclone mount's mount-point error stays critical; only Go's ENOTEMPTY is split out.
+            ("Fatal error: Directory is not empty: /Users/me/Mount If you want to mount it anyway use: --allow-non-empty option", "critical"),
+            ("something unexpected happened", "other"),
+            (nil, "unknown"),
+        ]
+        for (input, expected) in checks {
+            let got = TelemetryService.categorizeError(input)
+            guard got == expected else {
+                return report(name, slug, false, "(categorizeError(\(input.debugDescription)) = \(got), expected \(expected))")
+            }
+        }
+        // Every specific bucket is reachable by the table above.
+        let covered = Set(checks.map { $0.1 })
+        for bucket in TelemetryService.specificErrorBuckets.map({ $0.bucket }) where !covered.contains(bucket) {
+            return report(name, slug, false, "(no case covers the \(bucket) bucket)")
+        }
+
+        let operations: [(String?, String)] = [
+            ("Failed to copy: corrupted on transfer: sizes differ 1024 vs 2048", "copy"),
+            ("Failed to copy: mkdir /Users/me/Sync/new: operation not permitted", "copy"),
+            ("Couldn't delete: remove /Users/me/Sync/old.txt: permission denied", "delete"),
+            ("Failed to move: object not found", "move"),
+            ("Failed to rename: duplicate file", "move"),
+            ("error listing: directory not found", "list"),
+            ("failed to list directory: context deadline exceeded", "list"),
+            ("mkdir /Users/me/Sync/new: operation not permitted", "mkdir"),
+            ("failed to make directory: permission denied", "mkdir"),
+            ("can't copy - source file is being updated", "copy"),
+            ("Couldn't move: rename /Users/me/Sync/a.txt /Users/me/Sync/b.txt: permission denied", "move"),
+            ("error reading source directory: open /Users/me/Sync/Delete Me: permission denied", "list"),
+            ("error reading source root directory: directory not found", "list"),
+            ("error reading destination directory: googleapi: Error 403: rateLimitExceeded", "list"),
+            ("Failed to rmdir: remove /Users/me/Sync/old: directory not empty", "delete"),
+            ("failed to rmdirs: directory not found", "delete"),
+            ("Failed to Rmdir: directory not empty", "delete"),
+            ("open /Users/me/Sync/rmdir.sh: permission denied", "other"),
+            ("Failed to rmdir: remove /Users/me/Sync/mkdir-old: directory not empty", "delete"),
+            ("open /Users/me/Sync/mkdir.sh: permission denied", "other"),
+            ("RenameDir mkdir: permission denied", "mkdir"),
+            ("mkdir metadata: failed make directory: permission denied", "mkdir"),
+            ("something unexpected happened", "other"),
+            (nil, "other"),
+        ]
+        for (input, expected) in operations {
+            let got = TelemetryService.categorizeErrorOperation(input)
+            guard got == expected else {
+                return report(name, slug, false, "(categorizeErrorOperation(\(input.debugDescription)) = \(got), expected \(expected))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS3 — config.local_path_kind buckets a folder, never sends it
+
+    private static func testSyncPathKind() -> Bool {
+        let name = "AC-TS3", slug = "sync-path-kind"
+        let home = "/Users/Me"
+        let cases: [(String, String)] = [
+            ("/Users/Me/Pictures", "pictures"),
+            ("/users/me/PICTURES/", "pictures"),
+            ("~/Pictures/Holiday/2024", "pictures"),
+            ("//Users//Me//Pictures//", "pictures"),
+            ("/Users/Me/Documents/../Pictures", "pictures"),
+            ("~/Desktop", "desktop"),
+            ("~/Documents/Work/Reports", "documents"),
+            ("~/Downloads", "downloads"),
+            ("~/Music/Logic", "music"),
+            ("~/Movies", "movies"),
+            ("~/Public/Drop Box", "public"),
+            ("~/Library/Mobile Documents/com~apple~CloudDocs/Notes", "icloud_drive"),
+            ("~/Library/CloudStorage/GoogleDrive-me@example.com/My Drive", "cloud_storage"),
+            ("~/Library/Mail", "library"),
+            ("/Users/Me/Library", "library"),
+            ("~", "home_root"),
+            ("/Users/Me", "home_root"),
+            ("/users/me/", "home_root"),
+            ("~/Code/project", "home_other"),
+            ("~/PicturesArchive", "home_other"),
+            ("/Volumes/SeagateHD/Kaiju", "external_volume"),
+            ("/volumes/usb", "external_volume"),
+            ("/Volumes", "other"),
+            ("/Users/MeToo/Pictures", "other"),
+            ("/tmp/sync", "other"),
+            ("relative/folder", "other"),
+            ("", "unknown"),
+            ("   ", "unknown"),
+        ]
+        for (path, expected) in cases {
+            let got = SyncPathKind.classify(localPath: path, homeDirectory: home)
+            guard got == expected else {
+                return report(name, slug, false, "(classify(\(path.debugDescription)) = \(got), expected \(expected))")
+            }
+        }
+        // A trailing slash on the home directory itself changes nothing.
+        guard SyncPathKind.classify(localPath: "/Users/Me/Pictures", homeDirectory: "/Users/Me/") == "pictures" else {
+            return report(name, slug, false, "(a trailing slash on the home directory broke classification)")
+        }
+        let protectedKinds: [String] = ["desktop", "documents", "downloads", "icloud_drive", "library", "external_volume"]
+        let unprotectedKinds: [String] = ["pictures", "music", "movies", "public", "cloud_storage", "home_root", "home_other", "other", "unknown"]
+        for kind in protectedKinds where !SyncPathKind.isPrivacyProtected(kind) {
+            return report(name, slug, false, "(\(kind) should be privacy-protected)")
+        }
+        for kind in unprotectedKinds where SyncPathKind.isPrivacyProtected(kind) {
+            return report(name, slug, false, "(\(kind) should not be privacy-protected)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS4 — config.remote_type comes from rclone.conf, bucketed by an allowlist
+
+    private static func testRemoteBackendType() -> Bool {
+        let name = "AC-TS4", slug = "remote-backend-type"
+        guard RemoteBackendType.bucket("drive") == "drive",
+              RemoteBackendType.bucket("protondrive") == "protondrive",
+              RemoteBackendType.bucket("SMB") == "smb",
+              RemoteBackendType.bucket(" s3 ") == "s3",
+              RemoteBackendType.bucket("my-private-backend") == "other",
+              RemoteBackendType.bucket("") == "unknown",
+              RemoteBackendType.bucket(nil) == "unknown" else {
+            return report(name, slug, false, "(bucket mapped a known, unknown or missing type wrongly)")
+        }
+        for knownType in RemoteBackendType.knownTypes where RemoteBackendType.bucket(knownType) != knownType {
+            return report(name, slug, false, "(known type \(knownType) was not reported as itself)")
+        }
+
+        let config = """
+            # rclone.conf
+            [gdrive]
+            type = drive
+            scope = drive
+            token = {"access_token":"x","expiry":"2026-10-19T10:00:00Z"}
+
+            [proton]
+            client_id = abc
+            type=protondrive
+
+            [notype]
+            user = me
+
+            [future]
+            type = some-future-backend
+
+            [commented]
+            # type = drive
+            ; type = s3
+
+            [nas-smb]
+            host = nas.local
+            type = smb
+            """
+        let reads: [(String, String?)] = [
+            ("gdrive", "drive"),
+            ("proton", "protondrive"),
+            ("notype", nil),
+            ("future", "some-future-backend"),
+            ("commented", nil),
+            ("nas-smb", "smb"),
+            ("missing", nil),
+            ("", nil),
+        ]
+        for (remote, expected) in reads {
+            let got = RcloneConfigService.remoteType(named: remote, inConfig: config)
+            guard got == expected else {
+                return report(name, slug, false, "(remoteType(named: \(remote)) = \(String(describing: got)), expected \(String(describing: expected)))")
+            }
+        }
+
+        var profile = sampleProfile()
+        func types(_ rcloneConfig: String?) -> [String] {
+            let pair = RemoteBackendType.types(for: profile, rcloneConfig: rcloneConfig)
+            return [pair.primary, pair.fallback]
+        }
+        profile.rcloneRemote = "gdrive:"
+        profile.fallbackRemote = ""
+        let noFallback = types(config)
+        profile.fallbackRemote = "nas-smb"
+        let withFallback = types(config)
+        profile.fallbackRemote = "nas-smb:"
+        let withColonFallback = types(config)
+        let unreadable = types(nil)
+        profile.rcloneRemote = "future:"
+        profile.fallbackRemote = "missing"
+        let unknownTypes = types(config)
+        guard noFallback == ["drive", "none"],
+              withFallback == ["drive", "smb"],
+              withColonFallback == ["drive", "smb"],
+              unreadable == ["unknown", "unknown"],
+              unknownTypes == ["other", "unknown"] else {
+            return report(name, slug, false,
+                          "(types(for:) gave \(noFallback) / \(withFallback) / \(withColonFallback) / \(unreadable) / \(unknownTypes))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS5 — the Sync progress attributes carry counts, never file names
+
+    private static func testSyncProgressAttributes() -> Bool {
+        let name = "AC-TS5", slug = "sync-progress-attributes"
+        let profileId = UUID()
+        let secretFile = "Projects/Top Secret/zz-ts5-distinctive-file-name.mov"
+        let progress = SyncProgress(
+            bytesTransferred: 123_456_789,
+            totalBytes: 987_654_321,
+            eta: 3_600,
+            speed: 2_500_000.5,
+            transfersDone: 41,
+            totalTransfers: 977,
+            checksDone: 1_234,
+            totalChecks: 5_678,
+            elapsedTime: 42.5,
+            errors: 3,
+            transferringFiles: [
+                TransferringFile(name: secretFile, size: 1_000, bytes: 500, percentage: 50,
+                                 speed: 10, speedAvg: nil, eta: 50),
+            ],
+            listedCount: 9_999
+        )
+        let attrs = TelemetryService.syncProgressAttributes(
+            profileId: profileId, profileName: "Work", syncMode: .bisync,
+            progress: progress, runAgeSeconds: 7_200)
+        let values = attrs.mapValues { "\($0)" }
+        let expected: [String: String] = [
+            "synctray.profile.id": profileId.uuidString,
+            "synctray.profile.name": "Work",
+            "sync.mode": "bisync",
+            "sync.progress.has_stats": "true",
+            "sync.run_age_s": "7200.0",
+            "sync.progress.bytes_transferred": "123456789",
+            "sync.progress.bytes_total": "987654321",
+            "sync.progress.transfers_done": "41",
+            "sync.progress.transfers_total": "977",
+            "sync.progress.checks_done": "1234",
+            "sync.progress.checks_total": "5678",
+            "sync.progress.errors": "3",
+            "sync.progress.speed_bps": "2500000.5",
+            "sync.progress.eta_s": "3600",
+            "sync.progress.elapsed_s": "42.5",
+            "sync.progress.listed": "9999",
+        ]
+        guard values == expected else {
+            return report(name, slug, false, "(attributes were \(values.sorted(by: { $0.key < $1.key })))")
+        }
+        // No value is, or contains, a file being transferred — whole path or base name.
+        let baseName = (secretFile as NSString).lastPathComponent
+        guard !values.values.contains(where: { $0 == secretFile || $0.contains(baseName) || $0.contains("Top Secret") }) else {
+            return report(name, slug, false, "(an attribute carried a transferring file's name)")
+        }
+
+        // Before rclone's first stats line: has_stats false, no counts, no run age when unknown.
+        let bare = TelemetryService.syncProgressAttributes(
+            profileId: profileId, profileName: "Work", syncMode: .sync,
+            progress: nil, runAgeSeconds: nil).mapValues { "\($0)" }
+        guard bare == [
+            "synctray.profile.id": profileId.uuidString,
+            "synctray.profile.name": "Work",
+            "sync.mode": "sync",
+            "sync.progress.has_stats": "false",
+        ] else {
+            return report(name, slug, false, "(attributes without stats were \(bare.sorted(by: { $0.key < $1.key })))")
+        }
+
+        // Optional fields rclone hasn't reported yet are left out, not zero-filled.
+        let partial = SyncProgress(bytesTransferred: 1, totalBytes: 2, eta: nil, speed: nil,
+                                   transfersDone: 0, totalTransfers: 0)
+        let partialKeys = Set(TelemetryService.syncProgressAttributes(
+            profileId: profileId, profileName: "Work", syncMode: .bisync,
+            progress: partial, runAgeSeconds: nil).keys)
+        guard partialKeys.isDisjoint(with: ["sync.progress.speed_bps", "sync.progress.eta_s",
+                                            "sync.progress.elapsed_s", "sync.progress.listed", "sync.run_age_s"]),
+              partialKeys.contains("sync.progress.bytes_total") else {
+            return report(name, slug, false, "(nil optional progress fields were emitted: \(partialKeys.sorted()))")
+        }
+
+        // Every profile state has a bounded label; a paused profile is "paused" whatever its state.
+        let labels: [(SyncState, Bool, String)] = [
+            (.idle, false, "idle"),
+            (.syncing, false, "syncing"),
+            (.paused, false, "paused"),
+            (.error("Exit code 1: /Users/me/Sync/x"), false, "error"),
+            (.driveNotMounted, false, "drive_not_mounted"),
+            (.notConfigured, false, "not_configured"),
+            (.error("boom"), true, "paused"),
+        ]
+        for (syncState, paused, label) in labels {
+            let got = TelemetryService.profileStateLabel(syncState, isPaused: paused)
+            guard got == label else {
+                return report(name, slug, false, "(profileStateLabel(\(syncState), \(paused)) = \(got), expected \(label))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS6 — a failed sync run counts once, though it reports its failure twice
+
+    private static func testSyncFailureCountedOnce() -> Bool {
+        let name = "AC-TS6", slug = "sync-failure-counted-once"
+        let window = TelemetryService.duplicateSyncFailureWindow
+        let failedAt = Date(timeIntervalSince1970: 1_800_000_000)
+
+        // The decision: a repeat inside the window is the same run's; anything else counts.
+        let cases: [(lastFailureAt: Date?, now: Date, duplicate: Bool, label: String)] = [
+            (nil, failedAt, false, "no failure recorded yet"),
+            (failedAt, failedAt, true, "both end lines read in the same poll"),
+            (failedAt, failedAt.addingTimeInterval(5), true, "the second end line read one idle poll later"),
+            (failedAt, failedAt.addingTimeInterval(window - 0.001), true, "just inside the window"),
+            (failedAt, failedAt.addingTimeInterval(window), false, "at the end of the window"),
+            (failedAt, failedAt.addingTimeInterval(30 * 60), false, "the next scheduled run"),
+            (failedAt, failedAt.addingTimeInterval(-1), false, "a clock that stepped backwards"),
+        ]
+        for c in cases {
+            let got = TelemetryService.isDuplicateSyncFailure(lastFailureAt: c.lastFailureAt, now: c.now)
+            guard got == c.duplicate else {
+                return report(name, slug, false, "(\(c.label): isDuplicateSyncFailure = \(got), expected \(c.duplicate))")
+            }
+        }
+        // LogWatcher polls every 5 s when a profile isn't syncing, so a run's second end line
+        // can be read one poll after the first; a shorter window would count it again.
+        guard window > 5 else {
+            return report(name, slug, false, "(duplicateSyncFailureWindow is \(window) s, not longer than LogWatcher's 5 s idle poll)")
+        }
+
+        // Wiring, read from this run's own source next to this file (the AC-C5 technique):
+        // recordSyncFailed decides before it records any metric and remembers the failure it
+        // counted; a run start and a success both forget it.
+        let telemetryPath = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("TelemetryService.swift").path
+        guard let source = try? String(contentsOfFile: telemetryPath, encoding: .utf8) else {
+            return report(name, slug, false, "(could not read TelemetryService.swift to verify the wiring)")
+        }
+        // A method's body: from its signature to the closing brace at member indentation.
+        func body(of signature: String) -> Substring? {
+            guard let start = source.range(of: signature) else { return nil }
+            let rest = source[start.upperBound...]
+            guard let end = rest.range(of: "\n    }\n") else { return nil }
+            return rest[..<end.lowerBound]
+        }
+        func offset(of needle: String, in text: Substring) -> String.Index? {
+            text.range(of: needle)?.lowerBound
+        }
+
+        guard let failed = body(of: "func recordSyncFailed("),
+              let check = offset(of: "Self.isDuplicateSyncFailure(", in: failed) else {
+            return report(name, slug, false, "(recordSyncFailed does not call isDuplicateSyncFailure)")
+        }
+        for metric in ["syncCompletedCounter?.add", "syncErrorCounter?.add", "syncDurationHistogram?.record"] {
+            guard let recorded = offset(of: metric, in: failed), check < recorded else {
+                return report(name, slug, false, "(recordSyncFailed reaches \(metric) before deciding the failure is not a repeat)")
+            }
+        }
+        guard failed.contains("lastSyncFailureAt[profileId] = now") else {
+            return report(name, slug, false, "(recordSyncFailed does not remember the failure it counted)")
+        }
+
+        guard let started = body(of: "func recordSyncStarted("),
+              let reset = offset(of: "lastSyncFailureAt[profileId] = nil", in: started),
+              let tracerGuard = offset(of: "guard let tracer", in: started),
+              reset < tracerGuard else {
+            return report(name, slug, false, "(recordSyncStarted does not forget the last failure before its tracer guard)")
+        }
+        guard let completed = body(of: "func recordSyncCompleted("),
+              completed.contains("lastSyncFailureAt[profileId] = nil") else {
+            return report(name, slug, false, "(recordSyncCompleted does not forget the last failure)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SF1 — a failed run is handled once in the app, though it reports its failure twice
+
+    /// The app-side half of AC-TS6 (#122): the run's second end line must not set the error
+    /// again, send a second "Sync failed" notification, or record the failure again — but it
+    /// must still retry an auto-fix the exiting run's own lock refused.
+    private static func testSyncFailureHandledOnce() -> Bool {
+        let name = "AC-SF1", slug = "sync-failure-handled-once"
+        let window = TelemetryService.duplicateSyncFailureWindow
+        let failedAt = Date(timeIntervalSince1970: 1_800_000_000)
+
+        let cases: [(lastHandledAt: Date?, autoFix: AutoFixOutcome?, now: Date,
+                     expected: SyncManager.SyncFailureHandling, label: String)] = [
+            (nil, nil, failedAt, .handle, "no failure handled yet"),
+            (failedAt, nil, failedAt, .ignore, "both end lines read together, no auto-fix tried"),
+            (failedAt, .triggered, failedAt.addingTimeInterval(1), .ignore, "auto-fix already started"),
+            (failedAt, .gaveUpBackoff, failedAt.addingTimeInterval(1), .ignore, "auto-fix gave up"),
+            (failedAt, .notApplicable, failedAt.addingTimeInterval(1), .ignore, "auto-fix off or not bisync"),
+            (failedAt, .blockedAlreadyRunning, failedAt.addingTimeInterval(1), .retryAutoFixOnly,
+             "auto-fix refused while the failing run still held its lock"),
+            (failedAt, .blockedAlreadyRunning, failedAt.addingTimeInterval(window), .handle, "at the end of the window"),
+            (failedAt, .triggered, failedAt.addingTimeInterval(30 * 60), .handle, "the next scheduled run"),
+            (failedAt, nil, failedAt.addingTimeInterval(-1), .handle, "a clock that stepped backwards"),
+        ]
+        for c in cases {
+            let got = SyncManager.syncFailureHandling(lastHandledAt: c.lastHandledAt, autoFixOutcome: c.autoFix, now: c.now)
+            guard got == c.expected else {
+                return report(name, slug, false, "(\(c.label): syncFailureHandling = \(got), expected \(c.expected))")
+            }
+        }
+
+        // Wiring in processLogEvent, read from this build's own source.
+        guard let source = readSourceFile("Services/SyncManager.swift"),
+              let handler = source.range(of: "private func processLogEvent(") else {
+            return report(name, slug, false, "(could not read SyncManager.processLogEvent)")
+        }
+        func caseBody(from start: String, to end: String) -> Substring? {
+            guard let s = source.range(of: start, range: handler.upperBound..<source.endIndex),
+                  let e = source.range(of: end, range: s.upperBound..<source.endIndex) else { return nil }
+            return source[s.upperBound..<e.lowerBound]
+        }
+        guard let started = caseBody(from: "case .syncStarted:", to: "case .syncCompleted:"),
+              let completed = caseBody(from: "case .syncCompleted:", to: "case .syncFailed("),
+              let failed = caseBody(from: "case .syncFailed(let exitCode, let message):", to: "case .transportChanged(") else {
+            return report(name, slug, false, "(could not find the syncStarted / syncCompleted / syncFailed cases)")
+        }
+        guard started.contains("lastHandledSyncFailureAt[profileId] = nil"),
+              completed.contains("lastHandledSyncFailureAt[profileId] = nil") else {
+            return report(name, slug, false, "(a run start or a success no longer forgets the failure last handled)")
+        }
+        guard let decision = failed.range(of: "Self.syncFailureHandling("),
+              let skip = failed.range(of: "if handling != .handle {", range: decision.upperBound..<failed.endIndex),
+              let remember = failed.range(of: "lastHandledSyncFailureAt[profileId] = failureHandledAt",
+                                          range: skip.upperBound..<failed.endIndex),
+              failed[skip.upperBound..<remember.lowerBound].contains("break") else {
+            return report(name, slug, false, "(syncFailed does not skip a repeated failure before remembering this one)")
+        }
+        for effect in ["TelemetryService.shared.recordSyncFailed(", "notificationService.notifySyncError("] {
+            guard let at = failed.range(of: effect), remember.upperBound <= at.lowerBound else {
+                return report(name, slug, false, "(syncFailed reaches \(effect) before deciding the failure is not a repeat)")
+            }
+        }
+        // A new failure sets the error after the check; the repeat may only correct the exit
+        // code of an error already shown (rclone's notice has none), never raise one.
+        let repeatBlock = failed[skip.upperBound..<remember.lowerBound]
+        guard failed.range(of: "profileStates[profileId] = .error(", range: remember.upperBound..<failed.endIndex) != nil,
+              !repeatBlock.contains("profileStates[profileId] = .error(")
+                || repeatBlock.contains("if exitCode > 0, case .error = profileStates[profileId] {") else {
+            return report(name, slug, false,
+                "(syncFailed sets the error before deciding the failure is not a repeat, or the repeat raises an error that was not shown)")
+        }
+        // Every auto-fix attempt from this handler records what it did, or the repeat cannot
+        // tell a refused attempt from one that started.
+        let calls = failed.components(separatedBy: "triggerAutoFix(").count - 1
+        let stored = failed.components(separatedBy: "lastSyncFailureAutoFix[profileId] = triggerAutoFix(").count - 1
+        guard calls >= 2, calls == stored else {
+            return report(name, slug, false,
+                "(\(calls) auto-fix call(s) in syncFailed, \(stored) storing the outcome; expected the retry and the first attempt to both store it)")
+        }
+        guard let trigger = extractFunctionBody(startingAt: "func triggerAutoFix(for profile: SyncProfile)", in: source),
+              let blockedLog = trigger.range(of: "result: \"blocked_already_running\""),
+              let blockedReturn = trigger.range(of: "return .blockedAlreadyRunning"),
+              blockedLog.upperBound <= blockedReturn.lowerBound else {
+            return report(name, slug, false, "(triggerAutoFix no longer reports a refused attempt as .blockedAlreadyRunning)")
+        }
+        // An app-launched recovery run logs no start line, so starting one forgets the last
+        // failure — except auto-fix, which starts while that failure's end lines still arrive.
+        guard let begin = extractFunctionBody(startingAt: "func beginExclusiveRun(for profile: SyncProfile", in: source),
+              let notAutoFix = begin.range(of: "if source != .autoFix {"),
+              let forget = begin.range(of: "lastHandledSyncFailureAt[profile.id] = nil",
+                                       range: notAutoFix.upperBound..<begin.endIndex),
+              let granted = begin.range(of: "abortSuppressUntil[profile.id] = nil"),
+              granted.upperBound <= notAutoFix.lowerBound,
+              !begin[notAutoFix.upperBound..<forget.lowerBound].contains("}"),
+              begin[notAutoFix.upperBound...].prefix(400).contains("TelemetryService.shared.forgetLastSyncFailure(profileId: profile.id)") else {
+            return report(name, slug, false, "(beginExclusiveRun no longer forgets the last failure — in the app and in telemetry — for a recovery run, or does it for auto-fix too)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-AF1 — auto-fix stops when its resyncs succeed but never stick
+
+    /// #123: an auto-fix `--resync` succeeded every time while the next scheduled bisync failed
+    /// the same check-sync, for days; the 5-minute backoff never tripped and every resync
+    /// success reset it. A recurrence is an out-of-sync failure after a resync success with no
+    /// normal success in between; after `AutoFixRecurrence.limit` auto-fix stops, the profile
+    /// keeps an error naming the file, and only a normal success re-arms it.
+    private static func testAutoFixRecurringResync() -> Bool {
+        let name = "AC-AF1", slug = "auto-fix-recurring-resync"
+        guard AutoFixRecurrence.limit == 2 else {
+            return report(name, slug, false, "(recurrence limit is \(AutoFixRecurrence.limit), expected 2)")
+        }
+        // The loop from the issue: resync ok → fail → resync ok → fail → give up.
+        var count = 0
+        var trace: [String] = []
+        for resyncSucceeded in [false, true, true] {
+            let step = AutoFixRecurrence.next(previous: count, resyncSucceededSinceLastFailure: resyncSucceeded)
+            count = step.count
+            trace.append("\(step.count)\(step.giveUp ? "!" : "")")
+        }
+        guard trace == ["0", "1", "2!"] else {
+            return report(name, slug, false, "(recurrence trace \(trace), expected [0, 1, 2!])")
+        }
+        // Failures with no resync success in between (auto-fix refused, or the resync itself
+        // failed) are not recurrences, and do not reset the count.
+        let noResync = AutoFixRecurrence.next(previous: 1, resyncSucceededSinceLastFailure: false)
+        guard noResync.count == 1, !noResync.giveUp else {
+            return report(name, slug, false, "(a failure without a resync success changed the count: \(noResync))")
+        }
+
+        // The error names the file rclone reported, taken from the JSON line's `object`.
+        let rawLine = #"{"level":"error","msg":"Path1 file not found in Path2","object":"Docs/a b.pages","objectType":"string","source":"bisync/checksync.go:1","time":"2026-10-22T17:33:00.000000+02:00"}"#
+        let mismatch = AutoFixRecurrence.mismatchDescription(message: "Path1 file not found in Path2", rawLine: rawLine)
+        guard mismatch == "Path1 file not found in Path2: Docs/a b.pages",
+              AutoFixRecurrence.mismatchDescription(message: "Path2 file not found in Path1", rawLine: "not json")
+                == "Path2 file not found in Path1" else {
+            return report(name, slug, false, "(check-sync mismatch description wrong: \(mismatch))")
+        }
+        let withFile = AutoFixRecurrence.errorMessage(recurrences: 2, mismatch: mismatch)
+        let withoutFile = AutoFixRecurrence.errorMessage(recurrences: 2, mismatch: nil)
+        // "out of sync" in the text keeps the error banner's Fix Sync Issues button
+        // (detectErrorAction) and the heartbeat's `out_of_sync` category; it cannot re-arm
+        // auto-fix, which stays suppressed until a normal success.
+        guard withFile.contains("Docs/a b.pages"), withFile.contains("Fix Sync Issues"),
+              !withoutFile.contains("nil"), withoutFile.contains("sync log"),
+              withFile.contains("out of sync"), withoutFile.contains("out of sync"),
+              TelemetryService.categorizeError(withFile) == "out_of_sync" else {
+            return report(name, slug, false, "(give-up error text wrong: \(withFile) / \(withoutFile))")
+        }
+        guard SyncLogPatterns.isCheckSyncMismatch("Path1 file not found in Path2"),
+              SyncLogPatterns.isCheckSyncMismatch("Path2 file not found in Path1"),
+              !SyncLogPatterns.isCheckSyncMismatch("directory not found") else {
+            return report(name, slug, false, "(isCheckSyncMismatch misses bisync's check-sync lines)")
+        }
+        // The auto-fix start line still opens a run, and is told apart from a normal start.
+        let autoFixStart = "2026-10-22 17:35:00 - \(SyncLogPatterns.autoFixResyncStartLine)"
+        guard SyncLogPatterns.isSyncStarted(autoFixStart),
+              SyncLogPatterns.isAutoFixResyncStart(autoFixStart),
+              !SyncLogPatterns.isAutoFixResyncStart("2026-10-22 17:35:00 - Starting bisync") else {
+            return report(name, slug, false, "(the auto-fix resync start line is not recognised)")
+        }
+
+        // Wiring, read from this build's source.
+        guard let source = readSourceFile("Services/SyncManager.swift"),
+              let detailSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let handler = source.range(of: "private func processLogEvent(") else {
+            return report(name, slug, false, "(could not read the sources)")
+        }
+        func caseBody(from start: String, to end: String) -> Substring? {
+            guard let s = source.range(of: start, range: handler.upperBound..<source.endIndex),
+                  let e = source.range(of: end, range: s.upperBound..<source.endIndex) else { return nil }
+            return source[s.upperBound..<e.lowerBound]
+        }
+        guard let started = caseBody(from: "case .syncStarted:", to: "case .syncCompleted:"),
+              let completed = caseBody(from: "case .syncCompleted:", to: "case .syncFailed("),
+              let failed = caseBody(from: "case .syncFailed(let exitCode, let message):", to: "case .transportChanged("),
+              let errorCase = caseBody(from: "case .errorMessage(let message):", to: "case .driveNotMounted:") else {
+            return report(name, slug, false, "(could not find the processLogEvent cases)")
+        }
+        guard started.contains("SyncLogPatterns.isAutoFixResyncStart(event.rawLine)"),
+              errorCase.contains("SyncLogPatterns.isCheckSyncMismatch(message)") else {
+            return report(name, slug, false, "(a run's start no longer records whether it is the auto-fix resync, or check-sync files are not kept)")
+        }
+        // Only a normal success re-arms auto-fix: suppression and recurrence resets sit in the
+        // else branch of the auto-fix-resync check, and the resync's own success records itself
+        // (and, like every success, clears the backoff's attempts).
+        guard let resyncCheck = completed.range(of: "if autoFixResyncRunning.remove(profileId) != nil {"),
+              let elseBranch = completed.range(of: "} else {", range: resyncCheck.upperBound..<completed.endIndex),
+              completed[resyncCheck.upperBound..<elseBranch.lowerBound].contains("autoFixResyncSucceeded.insert(profileId)") else {
+            return report(name, slug, false, "(syncCompleted no longer tells the auto-fix resync's success apart)")
+        }
+        for reset in ["autoFixSuppressed.remove(profileId)", "autoFixRecurrences[profileId] = nil",
+                      "autoFixGaveUpRecurring.remove(profileId)"] {
+            guard let at = completed.range(of: reset), elseBranch.upperBound <= at.lowerBound else {
+                return report(name, slug, false, "(\(reset) is not limited to a normal success)")
+            }
+        }
+        // The backoff's attempt list clears on every success, the resync's included, or a
+        // short sync interval trips the backoff before the recurrence limit.
+        guard let attemptsReset = completed.range(of: "autoFixAttempts[profileId] = nil"),
+              attemptsReset.upperBound <= resyncCheck.lowerBound else {
+            return report(name, slug, false, "(the backoff's attempt list is no longer cleared on every success)")
+        }
+        guard let trigger = extractFunctionBody(startingAt: "func triggerAutoFix(for profile: SyncProfile)", in: source),
+              let suppressedGuard = trigger.range(of: "guard !autoFixSuppressed.contains(profileId) else {"),
+              let recurrenceCheck = trigger.range(of: "AutoFixRecurrence.next("),
+              let backoff = trigger.range(of: "attempts.append(now)"),
+              suppressedGuard.upperBound <= recurrenceCheck.lowerBound, recurrenceCheck.upperBound <= backoff.lowerBound,
+              let gaveUp = trigger.range(of: "result: \"gave_up_recurring\""),
+              let gaveUpReturn = trigger.range(of: "return .gaveUpRecurring"),
+              gaveUp.upperBound <= gaveUpReturn.lowerBound,
+              trigger.contains("result: resyncDidNotStick ? \"recurred\" : \"triggered\""),
+              trigger.contains("notificationService.notifyAutoFixGaveUpRecurring(") else {
+            return report(name, slug, false, "(triggerAutoFix no longer checks for a recurring resync before its backoff)")
+        }
+        // A failure's auto-fix refused by a live lock gets a delayed retry, from every call site.
+        let afterCalls = failed.components(separatedBy: "= triggerAutoFix(for: currentProfile)").dropFirst()
+        let calls = afterCalls.count
+        let retries = afterCalls.filter {
+            $0.drop(while: { $0.isWhitespace }).hasPrefix("scheduleAutoFixLockRetryIfRefused(for: profileId)")
+        }.count
+        guard calls >= 2, calls == retries else {
+            return report(name, slug, false, "(\(calls) auto-fix call(s) in syncFailed, \(retries) followed by the delayed lock retry)")
+        }
+        // Both resync paths split the extra flags like the script does (AC-AF2 checks parity).
+        guard let resync = extractFunctionBody(startingAt: "private func performResync(", in: source),
+              resync.contains("SyncSetupService.splitAdditionalFlags(additionalFlags)"),
+              !resync.contains("components(separatedBy: .whitespaces)"),
+              detailSource.contains("SyncSetupService.splitAdditionalFlags(capturedAdditionalFlags)"),
+              !detailSource.contains("capturedAdditionalFlags.components(separatedBy: .whitespaces)") else {
+            return report(name, slug, false, "(a resync path still splits additionalRcloneFlags on whitespace)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-AF2 — the app splits additionalRcloneFlags exactly as the sync script does
+
+    /// The auto-fix and editor resyncs used to split the extra flags on whitespace while the
+    /// script uses shlex + `~` / `$VAR` expansion, so the resync ran different filters than the
+    /// scheduled bisync it was repairing (#123). Runs the script's real splitter through the
+    /// dry-run seam and compares its argv with `SyncSetupService.splitAdditionalFlags`.
+    private static func testAdditionalFlagsSplitParity() -> Bool {
+        let name = "AC-AF2", slug = "additional-flags-split-parity"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/af2-\(UUID().uuidString)"
+        let local = "\(root)/mnt", cache = "\(root)/cache", target = "\(root)/remote-target"
+        for dir in [local, cache, target] {
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        let rcloneConfig = aliasRcloneConfig(name: "synology", path: target)
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+
+        // Direct expectations first, so the two splitters cannot agree on a wrong answer.
+        let expectations: [(flags: String, args: [String])] = [
+            ("--exclude \"some dir/**\" --filter-from ~/x.txt", ["--exclude", "some dir/**", "--filter-from", "\(home)/x.txt"]),
+            ("--log-file=~/y.log --exclude 'a b' --exclude a\\ b", ["--log-file=\(home)/y.log", "--exclude", "a b", "--exclude", "a b"]),
+            ("--exclude \"c\\\"d\" --exclude \"e\\f\"", ["--exclude", "c\"d", "--exclude", "e\\f"]),
+            ("--exclude \"$HOME/q\" --exclude '${HOME}/r' --exclude $SYNCTRAY_AF2_UNSET_VAR",
+             ["--exclude", "\(home)/q", "--exclude", "\(home)/r", "--exclude", "$SYNCTRAY_AF2_UNSET_VAR"]),
+            ("--bwlimit 10M  \t --transfers=8 --exclude x\"y\"'z'", ["--bwlimit", "10M", "--transfers=8", "--exclude", "xyz"]),
+        ]
+        for e in expectations {
+            guard let got = SyncSetupService.splitAdditionalFlags(e.flags), got == e.args else {
+                return report(name, slug, false, "(splitAdditionalFlags(\(e.flags)) = \(String(describing: SyncSetupService.splitAdditionalFlags(e.flags))), expected \(e.args))")
+            }
+        }
+        for malformed in ["--exclude \"unterminated", "--exclude 'open", "--exclude trailing\\"] {
+            guard SyncSetupService.splitAdditionalFlags(malformed) == nil else {
+                return report(name, slug, false, "(\(malformed) split instead of being refused, as the script refuses it)")
+            }
+        }
+
+        // Parity with the script's own splitter: same tokens, nothing added or dropped.
+        var baseline = mountFixtureProfile(localPath: local, cachePath: cache)
+        baseline.additionalRcloneFlags = ""
+        defer { try? fm.removeItem(atPath: baseline.cacheOnlyConfigPath) }
+        let base = dryRunMountScript(profile: baseline, rcloneConfig: rcloneConfig)
+        guard base.exitCode == 0, !base.args.isEmpty else {
+            return report(name, slug, false, "(baseline dry run failed: exit=\(base.exitCode) out=\(base.output) log=\(base.log))")
+        }
+        for e in expectations + [("--exclude ~root/x --exclude=~/z", [])] {
+            guard let ours = SyncSetupService.splitAdditionalFlags(e.flags) else {
+                return report(name, slug, false, "(splitAdditionalFlags refused \(e.flags))")
+            }
+            var profile = mountFixtureProfile(localPath: local, cachePath: cache)
+            profile.additionalRcloneFlags = e.flags
+            let run = dryRunMountScript(profile: profile, rcloneConfig: rcloneConfig)
+            guard run.exitCode == 0, run.args.count == base.args.count + ours.count,
+                  Array(run.args.suffix(ours.count)) == ours else {
+                return report(name, slug, false,
+                    "(script and app split \(e.flags) differently: script \(Array(run.args.dropFirst(base.args.count))), app \(ours); log=\(run.log))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-NT1 — a muted profile that keeps failing is still told, once per streak
+
+    /// #112: a muted profile failed every run for 10+ hours and its user was never told.
+    /// Muting silences change notices, not a broken profile: at
+    /// `mutedFailureNotifyThreshold` failed runs in a row, one notification goes out anyway.
+    private static func testMutedRepeatedFailureNotified() -> Bool {
+        let name = "AC-NT1", slug = "muted-repeated-failure-notified"
+        let threshold = SyncManager.mutedFailureNotifyThreshold
+        guard threshold == 3 else {
+            return report(name, slug, false, "(threshold is \(threshold), expected 3)")
+        }
+        let cases: [(muted: Bool, runs: Int, notifies: Bool)] = [
+            (false, 1, true), (false, 5, true),
+            (true, 1, false), (true, 2, false), (true, 3, true), (true, 4, false), (true, 30, false),
+        ]
+        for c in cases {
+            let got = SyncManager.notifiesSyncFailure(muted: c.muted, consecutiveFailedRuns: c.runs)
+            guard got == c.notifies else {
+                return report(name, slug, false, "(muted=\(c.muted), \(c.runs) failed runs: notifies=\(got), expected \(c.notifies))")
+            }
+        }
+        let notice = SyncManager.mutedRepeatedFailureNotice("Sync failed: boom", consecutiveFailedRuns: 3)
+        guard notice.hasPrefix("Notifications are muted"), notice.hasSuffix(". Sync failed: boom"), notice.contains("3 syncs") else {
+            return report(name, slug, false, "(muted notice text wrong: \(notice))")
+        }
+
+        guard let source = readSourceFile("Services/SyncManager.swift"),
+              let handler = source.range(of: "private func processLogEvent(") else {
+            return report(name, slug, false, "(could not read SyncManager.processLogEvent)")
+        }
+        func caseBody(from start: String, to end: String) -> Substring? {
+            guard let s = source.range(of: start, range: handler.upperBound..<source.endIndex),
+                  let e = source.range(of: end, range: s.upperBound..<source.endIndex) else { return nil }
+            return source[s.upperBound..<e.lowerBound]
+        }
+        guard let completed = caseBody(from: "case .syncCompleted:", to: "case .syncFailed("),
+              let failed = caseBody(from: "case .syncFailed(let exitCode, let message):", to: "case .transportChanged(") else {
+            return report(name, slug, false, "(could not find the syncCompleted / syncFailed cases)")
+        }
+        guard completed.contains("consecutiveFailedRuns[profileId] = nil") else {
+            return report(name, slug, false, "(a success no longer resets the failed-run count)")
+        }
+        // Counted after the repeated-end-line check (one failed run, one count), and the
+        // notification is gated by notifiesSyncFailure, not by mute alone.
+        guard let remembered = failed.range(of: "lastHandledSyncFailureAt[profileId] = failureHandledAt"),
+              let counted = failed.range(of: "consecutiveFailedRuns[profileId] = failedRuns"),
+              remembered.upperBound <= counted.lowerBound,
+              let gate = failed.range(of: "if Self.notifiesSyncFailure(muted: muted, consecutiveFailedRuns: failedRuns) {"),
+              let notify = failed.range(of: "notificationService.notifySyncError("),
+              counted.upperBound <= gate.lowerBound, gate.upperBound <= notify.lowerBound,
+              failed.contains("muted ? Self.mutedRepeatedFailureNotice(notificationText, consecutiveFailedRuns: failedRuns) : notificationText"),
+              !failed.contains("if !isNotificationsMuted(for: profileId) {") else {
+            return report(name, slug, false, "(syncFailed no longer counts failed runs once, mute alone still gates its notification, or a muted profile's notification lacks the reason)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS7 — switching telemetry on mid-session records the configuration snapshot
+
+    /// #112: the configuration snapshot was recorded only at launch, so an install that opted
+    /// in from Settings (or the banner, the wizard, `synctray telemetry on`) sent no profile
+    /// configuration until its next launch. Any off → on change of the setting while the app
+    /// runs now records it, from one observer on `UserDefaults` changes.
+    private static func testTelemetryOptInRecordsSnapshot() -> Bool {
+        let name = "AC-TS7", slug = "opt-in-records-configuration"
+        let cases: [(was: Bool, now: Bool, expected: Bool)] = [
+            (false, true, true), (true, true, false), (true, false, false), (false, false, false),
+        ]
+        for c in cases {
+            guard SyncManager.telemetryJustEnabled(wasEnabled: c.was, isEnabled: c.now) == c.expected else {
+                return report(name, slug, false, "(telemetryJustEnabled(\(c.was) → \(c.now)) != \(c.expected))")
+            }
+        }
+        guard let source = readSourceFile("Services/SyncManager.swift") else {
+            return report(name, slug, false, "(could not read SyncManager.swift)")
+        }
+        guard let snapshot = extractFunctionBody(startingAt: "func recordConfigurationSnapshot()", in: source),
+              snapshot.contains("TelemetryService.shared.recordProfileCount("),
+              snapshot.contains("TelemetryService.shared.recordAllProfileConfigurations(") else {
+            return report(name, slug, false, "(recordConfigurationSnapshot no longer records the profile count and configurations)")
+        }
+        guard let observer = extractFunctionBody(startingAt: "private func setupTelemetryOptInObserver()", in: source),
+              observer.contains("UserDefaults.didChangeNotification"),
+              observer.contains("self.telemetryWasEnabled = isEnabled"),
+              let decide = observer.range(of: "Self.telemetryJustEnabled("),
+              let record = observer.range(of: "self.recordConfigurationSnapshot()"),
+              decide.upperBound <= record.lowerBound else {
+            return report(name, slug, false, "(no observer records the snapshot when telemetry is switched on, or it no longer updates its baseline)")
+        }
+        // Wired at launch, after the launch snapshot, with the current value as the baseline
+        // so launch itself is not counted as an opt-in.
+        guard source.contains("        recordConfigurationSnapshot()\n        telemetryWasEnabled = SyncTraySettings.telemetryEnabled\n        setupTelemetryOptInObserver()\n") else {
+            return report(name, slug, false, "(SyncManager no longer records the snapshot at launch and then starts the opt-in observer)")
+        }
+        return report(name, slug, true)
+    }
+
     // MARK: - AC-SR7 — mount-mode liveness ignores lock files, registry only
 
     private static func testRunLivenessMountMode() -> Bool {
@@ -7934,6 +10701,964 @@ enum ConfigSelfTest {
             return report("AC-AB4", "abort-wiring-pinned", false, "(the profile card no longer swaps Pause for Abort while a run is live)")
         }
         return report("AC-AB4", "abort-wiring-pinned", true)
+    }
+
+    // MARK: - AC-FC1 — rclone error lines that name a file are errors, not file changes
+
+    /// rclone logs a failed operation at ERROR with the file as `object` ("Failed to copy: …",
+    /// "Couldn't delete: …", "Failed to rename: …"). Those must parse as `.errorMessage` — never
+    /// as a Copied/Updated/Deleted/Renamed change — while rclone's genuine INFO change lines,
+    /// and bisync's object-less change lines, still parse as file changes.
+    private static func testRcloneErrorLinesNotFileChanges() -> Bool {
+        let name = "AC-FC1", slug = "error-lines-not-file-changes"
+        let parser = LogParser()
+        let decoder = JSONDecoder()
+        func line(level: String, msg: String, object: String? = nil, source: String) -> String? {
+            var dict: [String: Any] = ["level": level, "msg": msg, "source": source,
+                                       "time": "2026-10-13T07:13:40.943947+02:00"]
+            if let object { dict["object"] = object; dict["objectType"] = "*local.Object" }
+            return (try? JSONSerialization.data(withJSONObject: dict)).flatMap { String(data: $0, encoding: .utf8) }
+        }
+
+        // Failed operations, shaped like rclone's own log calls.
+        let errorLines: [(level: String, msg: String, object: String, source: String)] = [
+            ("error", "Failed to copy: failed to open source object: open /Users/someone/Pictures/a.txt: operation not permitted",
+             "a.txt", "operations/copy.go:354"),
+            ("error", "Couldn't delete: permission denied", "old/notes.txt", "operations/operations.go:579"),
+            ("error", "Failed to rename: file already exists", "dup.txt", "operations/dedupe.go:68"),
+            // "new" in the text used to make this a Copied change.
+            ("critical", "Failed to copy: new upload rejected: quota exceeded", "big.mov", "operations/copy.go:354"),
+        ]
+        for entry in errorLines {
+            guard let raw = line(level: entry.level, msg: entry.msg, object: entry.object, source: entry.source),
+                  let decoded = try? decoder.decode(RcloneLogEntry.self, from: Data(raw.utf8)) else {
+                return report(name, slug, false, "(could not build or decode \(entry.msg.debugDescription))")
+            }
+            guard decoded.fileChange == nil else {
+                return report(name, slug, false, "(\(entry.msg.debugDescription) was read as a file change)")
+            }
+            guard let event = parser.parse(line: raw),
+                  case .errorMessage(let message) = event.type,
+                  message.contains(String(entry.msg.prefix(14))) else {
+                return report(name, slug, false, "(\(entry.msg.debugDescription) did not surface as an errorMessage)")
+            }
+        }
+
+        // Genuine changes still parse as changes (the first is a real rclone line).
+        let changeLines: [(raw: String?, path: String, operation: FileChange.Operation)] = [
+            (line(level: "info", msg: "Copied (new)", object: "Camera Roll/2026/10/IMG_5257.HEIC", source: "operations/copy.go:380"),
+             "Camera Roll/2026/10/IMG_5257.HEIC", .copied),
+            (line(level: "info", msg: "Copied (replaced existing)", object: "notes.txt", source: "operations/copy.go:380"),
+             "notes.txt", .updated),
+            (line(level: "info", msg: "Deleted", object: "old/notes.txt", source: "operations/operations.go:582"),
+             "old/notes.txt", .deleted),
+            (line(level: "info", msg: "- Path1    File was deleted          - KAIJU/file.mp4", source: "bisync/queue.go:1"),
+             "KAIJU/file.mp4", .deleted),
+        ]
+        for expected in changeLines {
+            guard let raw = expected.raw, let event = parser.parse(line: raw),
+                  case .fileChange(let change) = event.type,
+                  change.path == expected.path, change.operation == expected.operation else {
+                return report(name, slug, false, "(a genuine change for \(expected.path) no longer parses as \(expected.operation))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR1 — diagnostic report code
+
+    /// `ST-` + 6 characters from the look-alike-free alphabet, deterministic for a seeded
+    /// generator, and `isValid` accepts exactly that shape.
+    private static func testDiagnosticReportCode() -> Bool {
+        let name = "AC-DR1", slug = "diagnostic-report-code"
+        let allowed = Set("23456789ABCDEFGHJKMNPQRSTUVWXYZ")
+        guard Set(DiagnosticReportCode.alphabet) == allowed,
+              !"0O1IL".contains(where: { allowed.contains($0) }) else {
+            return report(name, slug, false, "(alphabet differs: \(String(DiagnosticReportCode.alphabet)))")
+        }
+        var rng = DiagnosticSelfTestRNG(state: 42)
+        var codes: [String] = []
+        for _ in 0..<200 {
+            codes.append(DiagnosticReportCode.generate(using: &rng))
+        }
+        for code in codes {
+            guard code.hasPrefix("ST-"), code.count == 9,
+                  code.dropFirst(3).allSatisfy({ allowed.contains($0) }),
+                  DiagnosticReportCode.isValid(code) else {
+                return report(name, slug, false, "(bad code \(code.debugDescription))")
+            }
+        }
+        guard Set(codes).count > 190 else {
+            return report(name, slug, false, "(only \(Set(codes).count) distinct codes in 200 draws)")
+        }
+        var first = DiagnosticSelfTestRNG(state: 7)
+        var second = DiagnosticSelfTestRNG(state: 7)
+        var firstCodes: [String] = []
+        var secondCodes: [String] = []
+        for _ in 0..<5 {
+            firstCodes.append(DiagnosticReportCode.generate(using: &first))
+            secondCodes.append(DiagnosticReportCode.generate(using: &second))
+        }
+        guard firstCodes == secondCodes else {
+            return report(name, slug, false, "(seeded generation is not deterministic: \(firstCodes) vs \(secondCodes))")
+        }
+        let valid = ["ST-ABCDEF", "ST-234567", "ST-Z9Y8X7", DiagnosticReportCode.generate()]
+        for code in valid where !DiagnosticReportCode.isValid(code) {
+            return report(name, slug, false, "(\(code.debugDescription) rejected)")
+        }
+        let invalid = ["", "ST-", "ST-ABC12", "ST-ABCDEFG", "st-ABCDEF", "ST-abcdef", "ST-ABCDE0",
+                       "ST-ABCDEO", "ST-ABCDE1", "ST-ABCDEI", "ST-ABCDEL", "SX-ABCDEF", "ST_ABCDEF",
+                       " ST-ABCDEF", "ST-ABCDEF "]
+        for code in invalid where DiagnosticReportCode.isValid(code) {
+            return report(name, slug, false, "(\(code.debugDescription) accepted)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR2 — diagnostic report redaction
+
+    /// Every secret form is replaced with `[REDACTED]` while the key or flag name stays
+    /// visible; ordinary file names and rclone JSON lines pass through unchanged; redacting
+    /// twice changes nothing.
+    private static func testDiagnosticRedaction() -> Bool {
+        let name = "AC-DR2", slug = "diagnostic-redaction"
+        guard DiagnosticRedactor.definedRuleCount == DiagnosticRedactor.compiledRuleCount,
+              DiagnosticRedactor.compiledRuleCount > 0 else {
+            return report(name, slug, false,
+                "(\(DiagnosticRedactor.definedRuleCount) rules defined, \(DiagnosticRedactor.compiledRuleCount) compiled)")
+        }
+        let redacted: [(input: String, expected: String)] = [
+            ("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig", "Authorization: [REDACTED]"),
+            (#"curl -H "Authorization: Bearer abcdefghijklmnop1234""#, #"curl -H "Authorization: [REDACTED]""#),
+            ("retrying with Bearer abcdefghijklmnopqrstuvwxyz012345", "retrying with Bearer [REDACTED]"),
+            (#"{"access_token":"ya29.a0AfH6SM","token_type":"Bearer","refresh_token":"1//0gabc","expiry":"2026-10-13T07:13:40Z"}"#,
+             #"{"access_token":"[REDACTED]","token_type":"Bearer","refresh_token":"[REDACTED]","expiry":"2026-10-13T07:13:40Z"}"#),
+            (#"{"password": "hunter2", "user": "alice"}"#, #"{"password": "[REDACTED]", "user": "alice"}"#),
+            (#"{"client_secret":"abc\"def","x":1}"#, #"{"client_secret":"[REDACTED]","x":1}"#),
+            ("password=hunter2", "password=[REDACTED]"),
+            ("pass: hunter2", "pass: [REDACTED]"),
+            ("passwd: hunter2", "passwd: [REDACTED]"),
+            ("token=abc123", "token=[REDACTED]"),
+            ("access_token=zzz", "access_token=[REDACTED]"),
+            ("refresh_token=zzz", "refresh_token=[REDACTED]"),
+            ("client_secret: zzz", "client_secret: [REDACTED]"),
+            ("secret = \"two words\"", "secret = [REDACTED]"),
+            ("api_key = abc123", "api_key = [REDACTED]"),
+            ("APIKEY=abc123", "APIKEY=[REDACTED]"),
+            ("auth_token: zzz", "auth_token: [REDACTED]"),
+            ("session_token=abc; path=/", "session_token=[REDACTED]; path=/"),
+            ("cookie=abc", "cookie=[REDACTED]"),
+            ("Cookie: a=b; c=d", "Cookie: [REDACTED]"),
+            ("https://host/cb?token=abc123&state=x", "https://host/cb?token=[REDACTED]&state=x"),
+            ("rclone sync /a remote:b --sftp-pass obscured123 --verbose", "rclone sync /a remote:b --sftp-pass [REDACTED] --verbose"),
+            ("rclone sync /a remote:b --sftp-pass=obscured123", "rclone sync /a remote:b --sftp-pass=[REDACTED]"),
+            ("--webdav-password secretvalue", "--webdav-password [REDACTED]"),
+            (#"--dropbox-token {"access_token":"x"}"#, "--dropbox-token [REDACTED]"),
+            ("--drive-client-secret abc", "--drive-client-secret [REDACTED]"),
+            ("--s3-secret-access-key AKIAXYZ", "--s3-secret-access-key [REDACTED]"),
+            ("--crypt-password2 abc", "--crypt-password2 [REDACTED]"),
+            (#""additionalRcloneFlags" : "--sftp-pass abc123 --fast-list","#,
+             #""additionalRcloneFlags" : "--sftp-pass [REDACTED] --fast-list","#),
+            ("webdav url https://alice:hunter2@dav.example.com/remote.php", "webdav url https://[REDACTED]@dav.example.com/remote.php"),
+            ("sftp://bob:pw@nas.local:22/volume1", "sftp://[REDACTED]@nas.local:22/volume1"),
+            ("RCLONE_CONFIG_MYNAS_PASS=obscured123", "RCLONE_CONFIG_MYNAS_PASS=[REDACTED]"),
+            (#"export RCLONE_CONFIG_GDRIVE_TOKEN={"access_token":"x"}"#, "export RCLONE_CONFIG_GDRIVE_TOKEN=[REDACTED]"),
+            ("RCLONE_CONFIG_S3_SECRET=abc", "RCLONE_CONFIG_S3_SECRET=[REDACTED]"),
+            ("RCLONE_RC_PASS=abc123", "RCLONE_RC_PASS=[REDACTED]"),
+            ("DASH0_AUTH_TOKEN=auth_abc123", "DASH0_AUTH_TOKEN=[REDACTED]"),
+            ("OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer abc123", "OTEL_EXPORTER_OTLP_HEADERS=[REDACTED]"),
+            ("OTEL_EXPORTER_OTLP_HEADERS=Dash0-Dataset=x,Authorization=Bearer abc123", "OTEL_EXPORTER_OTLP_HEADERS=[REDACTED]"),
+            ("secret_access_key = AKIAabc/xyz", "secret_access_key = [REDACTED]"),
+            // rclone connection string: the value runs to the next , ; & or space, so the
+            // trailing `:bucket` goes with it; the access key ID is not a secret.
+            (":s3,provider=AWS,access_key_id=AKIA1,secret_access_key=abc123:bucket",
+             ":s3,provider=AWS,access_key_id=AKIA1,secret_access_key=[REDACTED]"),
+            (#"{"private_key": "-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----\n"}"#,
+             #"{"private_key": "[REDACTED]"}"#),
+            ("X-Api-Key: abc123", "X-Api-Key: [REDACTED]"),
+            ("--azureblob-sas-url https://acct.blob.core.windows.net/c?sv=2022&sig=abc%2B123", "--azureblob-sas-url [REDACTED]"),
+            ("https://bucket.s3.amazonaws.com/o?X-Amz-Algorithm=AWS4&X-Amz-Signature=deadbeef",
+             "https://bucket.s3.amazonaws.com/o?X-Amz-Algorithm=AWS4&X-Amz-Signature=[REDACTED]"),
+        ]
+        for entry in redacted {
+            let got = DiagnosticRedactor.redact(entry.input)
+            guard got == entry.expected else {
+                return report(name, slug, false, "(\(entry.input.debugDescription) → \(got.debugDescription), want \(entry.expected.debugDescription))")
+            }
+            guard DiagnosticRedactor.redact(got) == got else {
+                return report(name, slug, false, "(redaction not idempotent for \(got.debugDescription))")
+            }
+        }
+        let unchanged = [
+            "/Users/alice/Documents/Keynote.key",
+            "Copied (new): passport.pdf",
+            "/Users/alice/token-ring notes.txt",
+            "/Users/alice/secret stuff/plan.txt",
+            #"rclone sync "/Users/alice/secret stuff/" remote:backup --fast-list"#,
+            "/Users/alice/a-b-token notes.txt",
+            #"{"level":"info","msg":"Copied (new)","object":"secret stuff/token-ring notes.txt","objectType":"*local.Object","source":"operations/copy.go:380","time":"2026-10-13T07:13:40.943947+02:00"}"#,
+            #"{"level":"error","msg":"Failed to copy: open /Users/alice/Keynote.key: operation not permitted","object":"Keynote.key","source":"operations/copy.go:354","time":"2026-10-13T07:13:40.943947+02:00"}"#,
+            #"{"level":"info","msg":"There was nothing to transfer","source":"sync/sync.go:954","time":"2026-10-13T07:13:41.1+02:00"}"#,
+            "2026-10-13 07:13:40 - Sync started (mode=bisync)",
+            "Basic notes.txt",
+            "smb://nas/share/a@b.txt",
+            #""remotePath" : "Kaiju/KAIJU","#,
+            "Compass: north.txt",
+            "bypass=1.txt",
+            "Design sig=draft.txt",
+            "",
+        ]
+        for line in unchanged {
+            let got = DiagnosticRedactor.redact(line)
+            guard got == line else {
+                return report(name, slug, false, "(ordinary line changed: \(line.debugDescription) → \(got.debugDescription))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR3 — diagnostic report builder
+
+    /// With a fake environment: the expected sections per profile, `lineLimit` honoured,
+    /// 8 KB line cap, redaction on every section, the 5 MB-style total cap dropping the
+    /// oldest log lines first, and no credential file ever requested from the reader.
+    private static func testDiagnosticReportBuilder() -> Bool {
+        let name = "AC-DR3", slug = "diagnostic-report-builder"
+        let bisync = sampleProfile(id: UUID(), name: "DR Bisync", isEnabled: true)
+        var stream = sampleProfile(id: UUID(), name: "DR Stream", isEnabled: true)
+        stream.syncMode = .mount
+        let profiles = [bisync, stream]
+
+        let longLine = String(repeating: "x", count: 10_000)
+        var logLines = (1...800).map { "log line \($0)" }
+        logLines.append(longLine)
+        logLines.append("Authorization: Bearer abcdefghijklmnopqrstuvwxyz")
+
+        var requested: [String] = []
+        let profileJSON = "{\n  \"additionalRcloneFlags\" : \"--sftp-pass hunter2\",\n  \"name\" : \"DR Bisync\"\n}\n"
+        // 101/102: this profile's script and its rclone child (named by parent, not args).
+        // 104: another profile's script; 105: the user's own unrelated rclone job; 106: a
+        // nested remote path and a sibling folder that only share a prefix. None may enter a
+        // report about these profiles. 107 names the profile's remote path exactly, so it does.
+        let psOutput = """
+              101     1 01:02:03 /bin/bash /Users/x/.local/bin/synctray-sync.sh \(bisync.configPath)
+              102   101    00:10 /opt/homebrew/bin/rclone bisync /a b: --sftp-pass hunter2
+              103     1    00:05 /usr/bin/vim notes.txt
+              104     1    00:07 /bin/bash /Users/x/.local/bin/synctray-sync.sh /Users/x/.config/synctray/profiles/other.json
+              105     1    00:09 /opt/homebrew/bin/rclone copy /Users/x/Private secret:vault
+              106     1    00:11 /opt/homebrew/bin/rclone sync \(bisync.fullRemotePath)/Nested \(bisync.localSyncPath)2
+              107     1    00:12 /opt/homebrew/bin/rclone nfsmount \(bisync.fullRemotePath) /Users/x/Mount
+
+            """
+        let env = DiagnosticReportEnvironment(
+            readFile: { path in
+                requested.append(path)
+                if path == bisync.profileFilePath { return profileJSON }
+                if path == bisync.filterFilePath { return "- .DS_Store\n- *.tmp\n" }
+                if path == bisync.lockFilePath { return "4242\n" }
+                return nil
+            },
+            tailLines: { path, count in
+                requested.append(path)
+                return path == bisync.logPath ? Array(logLines.suffix(count)) : nil
+            },
+            runProcess: { launchPath, _ in
+                if launchPath == "/bin/ps" { return (0, psOutput) }
+                return (0, "PID\tStatus\tLabel\n123\t0\t\(bisync.launchdLabel)\n124\t0\tcom.synctray.sync.otherjob\n-\t0\tcom.apple.other\n")
+            },
+            isProcessAlive: { $0 == 4242 },
+            statusJSON: { _ in "[\n  {\n    \"state\" : \"idle\"\n  }\n]\n" },
+            doctorLines: { _ in ["[ok] rclone: rclone v1.66.0"] },
+            now: { Date(timeIntervalSince1970: 1_791_868_420) },
+            appVersion: { "0.118.0+1.gabc1234" },
+            rcloneVersion: { "rclone v1.66.0" },
+            macOSVersion: { "Version 14.5" },
+            telemetryEnabled: { false },
+            makeCode: { "ST-ABCDEF" }
+        )
+
+        let built = DiagnosticReportBuilder.build(profiles: profiles, environment: env, lineLimit: 50)
+
+        let expectedSources: [DiagnosticReport.Source] = [
+            .system, .status, .doctor, .processes, .launchd,
+            .config, .filter, .locks, .log,
+            .config, .filter, .locks, .log,
+        ]
+        guard built.sections.map({ $0.source }) == expectedSources else {
+            return report(name, slug, false, "(sections \(built.sections.map { $0.source.rawValue }))")
+        }
+        guard built.sections[5...8].allSatisfy({ $0.profileId == bisync.id && $0.profileName == bisync.name }),
+              built.sections[9...12].allSatisfy({ $0.profileId == stream.id && $0.profileName == stream.name }),
+              built.sections[0...4].allSatisfy({ $0.profileId == nil }) else {
+            return report(name, slug, false, "(per-profile sections not tagged with their profile)")
+        }
+        guard built.code == "ST-ABCDEF", built.profileCount == 2,
+              built.appVersion == "0.118.0+1.gabc1234", built.rcloneVersion == "rclone v1.66.0" else {
+            return report(name, slug, false, "(header fields wrong: \(built.code) \(built.profileCount))")
+        }
+
+        let bisyncLog = built.sections[8].lines
+        guard bisyncLog.count == 50,
+              bisyncLog.last == "Authorization: [REDACTED]",
+              bisyncLog.first == "log line 753" else {
+            return report(name, slug, false, "(lineLimit not honoured: \(bisyncLog.count) lines, first \(bisyncLog.first ?? "-"))")
+        }
+        let marker = DiagnosticReportBuilder.truncationMarker
+        guard let cut = bisyncLog.first(where: { $0.hasSuffix(marker) }),
+              cut.utf8.count <= DiagnosticReportBuilder.maxLineBytes + marker.utf8.count,
+              cut.utf8.count > DiagnosticReportBuilder.maxLineBytes,
+              built.truncated,
+              built.notes.contains(where: { $0.contains("8 KB") }) else {
+            return report(name, slug, false, "(10 KB line not cut to 8 KB + marker)")
+        }
+
+        let rendered = built.render()
+        guard !rendered.contains("hunter2"),
+              built.sections[5].lines.contains(where: { $0.contains("--sftp-pass [REDACTED]") }),
+              built.sections[3].lines.count == 3,
+              built.sections[3].lines.allSatisfy({ !$0.contains("vim") && !$0.contains("other.json") && !$0.contains("vault") && !$0.contains("Nested") }),
+              built.sections[3].lines.contains(where: { $0.hasPrefix("pid=107 ") }),
+              DiagnosticReportBuilder.containsArgument("rclone sync /Users/x/My Work remote:a", "/Users/x/My Work"),
+              !DiagnosticReportBuilder.containsArgument("rclone sync /Users/x/My Work2 remote:a", "/Users/x/My Work"),
+              built.sections[3].lines.contains(where: { $0.contains("--sftp-pass [REDACTED]") && $0.hasPrefix("pid=102 ppid=101 elapsed=00:10 ") }),
+              built.sections[4].lines.contains(where: { $0.contains(bisync.launchdLabel) }),
+              !built.sections[4].lines.contains(where: { $0.contains("com.apple.other") || $0.contains("otherjob") }) else {
+            return report(name, slug, false, "(redaction or process/launchd filtering wrong)")
+        }
+        guard built.sections[7].lines.count == 2,
+              built.sections[7].lines[0].contains("held by pid 4242 (alive)"),
+              built.sections[7].lines[1].hasPrefix("Bisync session lock"),
+              built.sections[7].lines[1].hasSuffix(": absent"),
+              built.sections[11].lines.count == 1,
+              built.sections[11].lines[0].hasSuffix(": absent"),
+              built.sections[12].lines == ["(no sync log at \(stream.logPath))"] else {
+            return report(name, slug, false, "(lock or missing-log lines wrong: \(built.sections[7].lines) \(built.sections[11].lines))")
+        }
+        guard rendered.contains("Report code: ST-ABCDEF"),
+              rendered.contains("== Sync log — DR Bisync (\(bisync.shortId)) =="),
+              rendered.contains("SyncTray: 0.118.0+1.gabc1234"),
+              rendered.contains("Usage data sharing: off") else {
+            return report(name, slug, false, "(render() header or headings missing)")
+        }
+
+        // Never-read: every request is a planned read, none is a credential file, and the
+        // predicate recognises each never-read file.
+        let planned = Set(DiagnosticReportBuilder.plannedReads(for: profiles))
+        guard !requested.isEmpty,
+              Set(requested).isSubset(of: planned),
+              !requested.contains(where: { DiagnosticReportBuilder.isNeverRead($0) }),
+              !planned.contains(where: { DiagnosticReportBuilder.isNeverRead($0) }) else {
+            return report(name, slug, false, "(reader asked for an unplanned or never-read file: \(requested))")
+        }
+        let neverRead = [
+            "\(NSHomeDirectory())/.config/rclone/rclone.conf",
+            "/tmp/some/other/rclone.conf",
+            "\(NSHomeDirectory())/.config/synctray/.env",
+            SyncProfile.rcAuthPath(port: stream.rcPort),
+            stream.cacheOnlyConfigPath,
+        ]
+        let readable = [bisync.logPath, bisync.profileFilePath, bisync.filterFilePath, bisync.lockFilePath,
+                        SyncRunLock.sessionLockPath(for: bisync)]
+        guard neverRead.allSatisfy({ DiagnosticReportBuilder.isNeverRead($0) }),
+              readable.allSatisfy({ !DiagnosticReportBuilder.isNeverRead($0) }) else {
+            return report(name, slug, false, "(isNeverRead misclassifies a path)")
+        }
+
+        // Total cap: the oldest log lines go first, the newest survive, and it is noted.
+        let capped = DiagnosticReportBuilder.build(profiles: profiles, environment: env, lineLimit: 802, maxReportBytes: 12_000)
+        let cappedLog = capped.sections[8].lines
+        let cappedBytes = capped.sections.reduce(0) { sum, section in
+            sum + section.lines.reduce(0) { $0 + $1.utf8.count + 1 }
+        }
+        guard cappedLog.first?.hasPrefix("…[") == true,
+              cappedLog.last == "Authorization: [REDACTED]",
+              cappedBytes <= 12_000 + 200,
+              capped.truncated,
+              capped.notes.contains(where: { $0.contains("left out") }) else {
+            return report(name, slug, false, "(total cap not applied oldest-first: \(cappedBytes) bytes, first \(cappedLog.first ?? "-"))")
+        }
+        // A profile with no log keeps its "(no sync log at …)" line — the cap never turns it
+        // into a misleading "…[1 older log line(s) left out]".
+        guard capped.sections[12].lines == ["(no sync log at \(stream.logPath))"] else {
+            return report(name, slug, false, "(cap dropped the missing-log placeholder: \(capped.sections[12].lines))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR4 — diagnostic report OTLP encoding
+
+    /// Summary record first; every record carries `diagnostics.report_id` and is stamped
+    /// createdAt + its ordinal (strictly increasing, report order); an rclone JSON line maps to
+    /// severity and `rclone.*` attributes, its own time kept as `rclone.time`; a plain line is
+    /// INFO; batches split at 200 records and at ~1 MB; the resource carries
+    /// `synctray.process.kind=diagnostics` and, with usage data off, no install identity.
+    private static func testDiagnosticOTLPEncoding() -> Bool {
+        let name = "AC-DR4", slug = "diagnostic-otlp-encoding"
+        let profileId = UUID()
+        let plainLine = "2026-10-13 07:13:40 - Sync started"
+        let errorLine = #"{"level":"error","msg":"Failed to copy: quota exceeded","object":"big.mov","source":"operations/copy.go:354","time":"2026-10-13T07:13:40.943947+02:00"}"#
+        let warnLine = #"{"level":"warning","msg":"Retrying","time":"2026-10-13T07:13:41Z"}"#
+        let fixture = DiagnosticReport(
+            code: "ST-ABCDEF",
+            createdAt: Date(timeIntervalSince1970: 1_791_868_000),
+            sections: [
+                DiagnosticReport.Section(source: .system, lines: ["SyncTray version: x"]),
+                DiagnosticReport.Section(source: .log, profileId: profileId, profileName: "Work",
+                                         lines: [plainLine, errorLine, warnLine]),
+            ],
+            truncated: true
+        )
+        let records = DiagnosticOTLPEncoder.records(for: fixture)
+        guard records.count == 5 else {
+            return report(name, slug, false, "(expected 5 records, got \(records.count))")
+        }
+        let summary = records[0]
+        guard summary.body == "Diagnostic report",
+              summary.attributes["diagnostics.profile_count"] == .int(1),
+              summary.attributes["diagnostics.line_count"] == .int(4),
+              summary.attributes["diagnostics.truncated"] == .bool(true),
+              summary.timeUnixNano == 1_791_868_000_000_000_000 else {
+            return report(name, slug, false, "(summary record wrong: \(summary))")
+        }
+        guard records.allSatisfy({ $0.attributes["diagnostics.report_id"] == .string("ST-ABCDEF") }) else {
+            return report(name, slug, false, "(a record lacks diagnostics.report_id)")
+        }
+        let times = records.map { $0.timeUnixNano }
+        guard times == (0..<UInt64(records.count)).map({ 1_791_868_000_000_000_000 + $0 }) else {
+            return report(name, slug, false, "(records not stamped createdAt + ordinal in report order: \(times))")
+        }
+        let system = records[1], plain = records[2], error = records[3], warn = records[4]
+        guard system.attributes["synctray.profile.id"] == nil,
+              system.attributes["diagnostics.source"] == .string("system"),
+              plain.severityNumber == 9, plain.severityText == "INFO",
+              plain.timeUnixNano == 1_791_868_000_000_000_002,
+              plain.attributes["rclone.level"] == nil,
+              plain.attributes["rclone.time"] == nil,
+              plain.attributes["diagnostics.line"] == .int(1),
+              plain.attributes["synctray.profile.id"] == .string(profileId.uuidString),
+              plain.attributes["synctray.profile.name"] == .string("Work") else {
+            return report(name, slug, false, "(plain line record wrong: \(plain))")
+        }
+        guard error.severityNumber == 17, error.severityText == "ERROR",
+              error.timeUnixNano == 1_791_868_000_000_000_003,
+              error.attributes["rclone.time"] == .string("2026-10-13T07:13:40.943947+02:00"),
+              error.body == errorLine,
+              error.attributes["rclone.level"] == .string("error"),
+              error.attributes["rclone.msg"] == .string("Failed to copy: quota exceeded"),
+              error.attributes["rclone.object"] == .string("big.mov"),
+              error.attributes["diagnostics.source"] == .string("log"),
+              error.attributes["diagnostics.line"] == .int(2) else {
+            return report(name, slug, false, "(rclone error line record wrong: \(error))")
+        }
+        guard warn.severityNumber == 13, warn.severityText == "WARN",
+              warn.timeUnixNano == 1_791_868_000_000_000_004,
+              warn.attributes["rclone.time"] == .string("2026-10-13T07:13:41Z"),
+              warn.attributes["rclone.object"] == nil else {
+            return report(name, slug, false, "(rclone warning line record wrong: \(warn))")
+        }
+        let levels = ["critical", "notice", "info", "debug", "weird"].map { DiagnosticOTLPEncoder.severity(forRcloneLevel: $0).number }
+        guard levels == [17, 9, 9, 5, 9] else {
+            return report(name, slug, false, "(level mapping \(levels))")
+        }
+
+        // Batching + JSON shape.
+        let big = DiagnosticReport(
+            code: "ST-ABCDEF",
+            createdAt: Date(timeIntervalSince1970: 1_791_868_000),
+            sections: [DiagnosticReport.Section(source: .log, profileId: profileId, profileName: "Work",
+                                                lines: (1...450).map { "line \($0)" })]
+        )
+        let batches = DiagnosticOTLPEncoder.batches(DiagnosticOTLPEncoder.records(for: big))
+        guard batches.map({ $0.count }) == [200, 200, 51] else {
+            return report(name, slug, false, "(batch sizes \(batches.map { $0.count }))")
+        }
+        // Byte cap: well under 200 records, but ~100 KB each, so requests split near 1 MB;
+        // a single record bigger than the cap still goes, alone.
+        let heavy = DiagnosticReport(
+            code: "ST-ABCDEF",
+            createdAt: Date(timeIntervalSince1970: 1_791_868_000),
+            sections: [DiagnosticReport.Section(source: .log, profileId: profileId, profileName: "Work",
+                                                lines: Array(repeating: String(repeating: "x", count: 100_000), count: 30)
+                                                    + [String(repeating: "y", count: 1_200_000)])]
+        )
+        let heavyRecords = DiagnosticOTLPEncoder.records(for: heavy)
+        let heavyBatches = DiagnosticOTLPEncoder.batches(heavyRecords)
+        let withinCap = heavyBatches.allSatisfy { batch -> Bool in
+            let bytes = batch.reduce(0) { $0 + DiagnosticOTLPEncoder.estimatedSize($1) }
+            return batch.count == 1 || bytes <= DiagnosticOTLPEncoder.maxBatchBytes
+        }
+        guard heavyBatches.count > 1, withinCap,
+              heavyBatches.allSatisfy({ $0.count <= DiagnosticOTLPEncoder.maxRecordsPerBatch }),
+              Array(heavyBatches.joined()) == heavyRecords,
+              heavyBatches.last?.count == 1,
+              heavyBatches.last?.first?.body.utf8.count == 1_200_000 else {
+            return report(name, slug, false, "(byte cap not applied: batch sizes \(heavyBatches.map { $0.count }))")
+        }
+
+        let identityBase = ["service.name": "synctray", "synctray.process.kind": "app",
+                            "enduser.id": "hash", "service.instance.id": "install"]
+        let resource = DiagnosticReportUploader.resourceAttributes(base: identityBase, telemetryEnabled: false)
+        let resourceWithUsage = DiagnosticReportUploader.resourceAttributes(base: identityBase, telemetryEnabled: true)
+        guard resource["synctray.process.kind"] == "diagnostics", resource["service.name"] == "synctray",
+              resource["enduser.id"] == nil, resource["service.instance.id"] == nil,
+              resourceWithUsage["synctray.process.kind"] == "diagnostics",
+              resourceWithUsage["enduser.id"] == "hash", resourceWithUsage["service.instance.id"] == "install" else {
+            return report(name, slug, false, "(resource process kind or install identity wrong: off=\(resource) on=\(resourceWithUsage))")
+        }
+        let bodies = DiagnosticOTLPEncoder.encodeBatches(for: big, resource: resource)
+        guard bodies.count == 3,
+              let firstBody = bodies.first,
+              let root = (try? JSONSerialization.jsonObject(with: firstBody)) as? [String: Any],
+              let resourceLogs = root["resourceLogs"] as? [[String: Any]],
+              let resourceObject = resourceLogs.first?["resource"] as? [String: Any],
+              let resourceAttributes = resourceObject["attributes"] as? [[String: Any]],
+              let scopeLogs = resourceLogs.first?["scopeLogs"] as? [[String: Any]],
+              let logRecords = scopeLogs.first?["logRecords"] as? [[String: Any]],
+              logRecords.count == 200,
+              let summaryRecord = logRecords.first,
+              let summaryBody = summaryRecord["body"] as? [String: Any],
+              summaryBody["stringValue"] as? String == "Diagnostic report",
+              summaryRecord["timeUnixNano"] as? String == "1791868000000000000",
+              summaryRecord["severityNumber"] as? Int == 9 else {
+            return report(name, slug, false, "(first OTLP JSON body has the wrong shape)")
+        }
+        let kind = resourceAttributes.first(where: { ($0["key"] as? String) == "synctray.process.kind" })
+        let kindValue = kind?["value"] as? [String: Any]
+        let summaryAttributes = summaryRecord["attributes"] as? [[String: Any]] ?? []
+        let lineCountAttribute = summaryAttributes.first(where: { ($0["key"] as? String) == "diagnostics.line_count" })
+        let lineCount = lineCountAttribute?["value"] as? [String: Any]
+        guard kindValue?["stringValue"] as? String == "diagnostics",
+              lineCount?["intValue"] as? String == "450" else {
+            return report(name, slug, false, "(resource kind or intValue encoding wrong)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR5 — `synctray report` parsing
+
+    private static func testCLIReportParsing() -> Bool {
+        let name = "AC-DR5", slug = "cli-report-parse"
+        let defaultLines = DiagnosticReportBuilder.defaultLineLimit
+        guard SyncTrayCLI.parse(["report"])
+                == .success(.report(target: nil, lines: defaultLines, output: nil, send: false, yes: false, json: false)),
+              SyncTrayCLI.parse(["report", "Work", "--lines", "50", "--output", "x"])
+                == .success(.report(target: "Work", lines: 50, output: "x", send: false, yes: false, json: false)),
+              SyncTrayCLI.parse(["report", "--send", "--yes", "--json"])
+                == .success(.report(target: nil, lines: defaultLines, output: nil, send: true, yes: true, json: true)),
+              SyncTrayCLI.parse(["report", "abcd1234", "--lines=20", "--send"])
+                == .success(.report(target: "abcd1234", lines: 20, output: nil, send: true, yes: false, json: false)) else {
+            return report(name, slug, false, "(a valid report invocation did not parse as expected)")
+        }
+        let bad: [[String]] = [
+            ["report", "--lines", "abc"], ["report", "--lines", "0"], ["report", "--lines", "-5"],
+            ["report", "--lines"], ["report", "--output"], ["report", "--sned"], ["report", "a", "b"],
+            ["report", "--json"],
+        ]
+        for argv in bad {
+            guard case .failure = SyncTrayCLI.parse(argv) else {
+                return report(name, slug, false, "(\(argv) parsed but must be a usage error)")
+            }
+        }
+        var err = ""
+        let env = fakeCLIEnvironment(stderr: { err += $0 })
+        guard SyncTrayCLI.execute(["report", "--lines", "abc"], env: env) == 64, err.contains("--lines") else {
+            return report(name, slug, false, "(bad --lines did not exit 64 with a message: \(err.debugDescription))")
+        }
+        guard SyncTrayCLI.telemetryVerb(for: ["report"]) == "report",
+              SyncTrayCLI.telemetryVerb(for: ["report", "Work", "--send", "--yes"]) == "report-send",
+              SyncTrayCLI.usage.contains("report [name|id]") else {
+            return report(name, slug, false, "(telemetry verbs or help text missing report)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR7 — Cancel while collecting never sends; a retry never re-sends
+
+    /// The sheet's build task is cancelled by Cancel and on close, and the build checks for
+    /// cancellation before running its action — so Send then Cancel uploads nothing. A failed
+    /// send drops the cached report, so a retry sends a new report rather than duplicates.
+    private static func testReportSheetCancelStopsSend() -> Bool {
+        let name = "AC-DR7", slug = "report-sheet-cancel-stops-send"
+        guard let source = readSourceFile("Views/Settings/DiagnosticReportSheet.swift") else {
+            return report(name, slug, false, "(could not read DiagnosticReportSheet.swift)")
+        }
+        let build = extractFunctionBody(startingAt: "private func withReport(", in: source) ?? ""
+        let guarded: Bool = {
+            guard let task = build.range(of: "buildTask = Task"),
+                  let check = build.range(of: "guard !Task.isCancelled else { return }"),
+                  let action = build.range(of: "action(built.report)") else { return false }
+            return task.lowerBound < check.lowerBound && check.lowerBound < action.lowerBound
+        }()
+        let cancels = source.components(separatedBy: "buildTask?.cancel()").count - 1
+        // A failed send drops the cached report, so a retry never re-sends landed batches.
+        let send = extractFunctionBody(startingAt: "private func send(", in: source) ?? ""
+        let dropsOnFailure = send.range(of: "catch")
+            .map { send[$0.upperBound...].contains("report = nil") } ?? false
+        guard guarded, cancels >= 2, dropsOnFailure else {
+            return report(name, slug, false, "(build checks cancellation before its action: \(guarded); cancel sites: \(cancels)/2; failed send drops the report: \(dropsOnFailure))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR6 — `synctray report` consent and send routing
+
+    /// Without `--send` the report is printed and never sent; a non-interactive `--send`
+    /// without `--yes` refuses (exit 64) before building or sending; `--send --yes` sends
+    /// exactly once and prints the code.
+    private static func testCLIReportExecute() -> Bool {
+        let name = "AC-DR6", slug = "cli-report-execute"
+        let profile = sampleProfile(id: UUID(), name: "DR Work", isEnabled: true)
+        let fixture = DiagnosticReport(
+            code: "ST-ABCDEF",
+            createdAt: Date(timeIntervalSince1970: 1_791_868_000),
+            sections: [DiagnosticReport.Section(source: .log, profileId: profile.id, profileName: profile.name, lines: ["hello"])]
+        )
+        var out = "", err = ""
+        var built = 0, sent = 0, builtLimit = 0
+        var builtProfiles: [SyncProfile] = []
+        var written: [String: String] = [:]
+        var interactive = false
+        var answer: String? = nil
+        var sendResult: String? = nil
+        var env = fakeCLIEnvironment(
+            readProfiles: { [profile] },
+            isInteractiveTerminal: { interactive },
+            readLine: { answer },
+            stdout: { out += $0 },
+            stderr: { err += $0 }
+        )
+        env.buildDiagnosticReport = { profiles, limit in
+            built += 1
+            builtProfiles = profiles
+            builtLimit = limit
+            return fixture
+        }
+        env.sendDiagnosticReport = { _ in
+            sent += 1
+            return sendResult
+        }
+        env.writeTextFile = { path, contents in
+            written[path] = contents
+            return true
+        }
+        func reset() { out = ""; err = ""; built = 0; sent = 0 }
+
+        // No --send: print, never send.
+        guard SyncTrayCLI.execute(["report"], env: env) == 0,
+              out == fixture.render(), err.contains("Nothing was sent."),
+              built == 1, sent == 0, builtLimit == DiagnosticReportBuilder.defaultLineLimit,
+              builtProfiles == [profile] else {
+            return report(name, slug, false, "(plain report printed wrong or sent: out=\(out.prefix(80).debugDescription) sent=\(sent))")
+        }
+        reset()
+        guard SyncTrayCLI.execute(["report", "DR Work", "--lines", "20", "--output", "/tmp/dr6.txt"], env: env) == 0,
+              out == "/tmp/dr6.txt\n", written["/tmp/dr6.txt"] == fixture.render(),
+              builtLimit == 20, sent == 0, err.contains("Nothing was sent.") else {
+            return report(name, slug, false, "(--output did not write and print the path, or sent)")
+        }
+        reset()
+        guard SyncTrayCLI.execute(["report", "nope"], env: env) == 1, built == 0, sent == 0 else {
+            return report(name, slug, false, "(unknown target built or sent)")
+        }
+
+        // Non-interactive --send without --yes: refuse before building or sending.
+        reset()
+        interactive = false
+        guard SyncTrayCLI.execute(["report", "--send"], env: env) == 64,
+              built == 0, sent == 0,
+              err.contains(DiagnosticReportCopy.disclosure), err.contains("--yes"), out.isEmpty else {
+            return report(name, slug, false, "(non-interactive --send without --yes did not refuse: \(err.debugDescription))")
+        }
+        // Interactive: No by default (EOF, empty, "n").
+        for declined in [nil, "", "n", "nope"] as [String?] {
+            reset()
+            interactive = true
+            answer = declined
+            guard SyncTrayCLI.execute(["report", "--send"], env: env) == 1, sent == 0,
+                  err.contains("Send this report? [y/N]"), err.contains("Nothing was sent.") else {
+                return report(name, slug, false, "(answer \(declined.debugDescription) sent the report)")
+            }
+        }
+        reset()
+        interactive = true
+        answer = nil
+        guard SyncTrayCLI.execute(["report", "DR Work", "--send"], env: env) == 1, sent == 0,
+              err.contains("Preview it first with: synctray report 'DR Work'"),
+              SyncTrayCLI.shellQuoted("Bob's Work") == #"'Bob'\''s Work'"# else {
+            return report(name, slug, false, "(preview hint not shell-quoted: \(err.debugDescription))")
+        }
+        reset()
+        interactive = true
+        answer = "y"
+        guard SyncTrayCLI.execute(["report", "--send"], env: env) == 0, sent == 1,
+              out == "Report code: ST-ABCDEF\n" else {
+            return report(name, slug, false, "(interactive yes did not send once)")
+        }
+
+        // --send --yes: send exactly once, print the code.
+        reset()
+        interactive = false
+        guard SyncTrayCLI.execute(["report", "--send", "--yes"], env: env) == 0,
+              sent == 1, built == 1,
+              out == "Report code: ST-ABCDEF\n",
+              err.contains(DiagnosticReportCopy.disclosure),
+              err.contains(DiagnosticReportCopy.shareCode) else {
+            return report(name, slug, false, "(--send --yes did not send once and print the code: sent=\(sent) out=\(out.debugDescription))")
+        }
+        reset()
+        guard SyncTrayCLI.execute(["report", "--send", "--yes", "--json"], env: env) == 0,
+              sent == 1, out == "{\"code\":\"ST-ABCDEF\"}\n" else {
+            return report(name, slug, false, "(--json output wrong: \(out.debugDescription))")
+        }
+        reset()
+        sendResult = "Diagnostic upload isn't configured in this build."
+        guard SyncTrayCLI.execute(["report", "--send", "--yes"], env: env) == 1,
+              sent == 1, out.isEmpty, err.contains("isn't configured") else {
+            return report(name, slug, false, "(a failed send did not exit 1 with the error)")
+        }
+
+        // The saved copy (`--output`, Save to Desktop) is owner-only, including when it
+        // replaces an existing world-readable file.
+        let privatePath = "\(selfTestRoot)/dr6-report.txt"
+        FileManager.default.createFile(atPath: privatePath, contents: Data("old".utf8),
+                                       attributes: [.posixPermissions: 0o644])
+        do {
+            try DiagnosticReportFile.writePrivately("report body", toPath: privatePath)
+        } catch {
+            return report(name, slug, false, "(writePrivately threw: \(error))")
+        }
+        let attributes = (try? FileManager.default.attributesOfItem(atPath: privatePath)) ?? [:]
+        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+        guard permissions == 0o600,
+              (try? String(contentsOfFile: privatePath, encoding: .utf8)) == "report body" else {
+            return report(name, slug, false, "(saved report not 0600 or content wrong: \(String(describing: permissions)))")
+        }
+
+        // A directory at the output path is refused and left intact — never removed
+        // (`--output ~/Documents` must not delete the folder).
+        let directoryPath = "\(selfTestRoot)/dr6-output-dir"
+        let keptFile = "\(directoryPath)/keep.txt"
+        try? FileManager.default.createDirectory(atPath: directoryPath, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: keptFile, contents: Data("keep".utf8))
+        let refused = (try? DiagnosticReportFile.writePrivately("report body", toPath: directoryPath)) == nil
+        guard refused, FileManager.default.fileExists(atPath: keptFile) else {
+            return report(name, slug, false, "(writePrivately replaced a directory at the output path)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-MB1 — menu bar icon appearance resolves to the right colors
+
+    /// App Settings → Menu Bar Icon, an accessibility setting: the default blue ring has
+    /// little contrast on a blue-tinted menu bar. The default must stay exactly the look
+    /// it replaced, Monochrome must be a template image without status colors, and Custom
+    /// must use the picked colors, falling back to the defaults for an unset or malformed
+    /// one. The stored raw values are a contract (users' UserDefaults hold them).
+    private static func testMenuBarIconAppearance() -> Bool {
+        let name = "AC-MB1", slug = "menu-bar-icon-appearance"
+
+        // Default (and an unset preference): the look before the setting existed.
+        let standard = MenuBarIconAppearance.standard
+        guard MenuBarIconAppearance.defaultStyle == .color,
+              menuBarColorsMatch(standard.syncingColor, .systemBlue),
+              menuBarColorsMatch(standard.idleColor, .gray),
+              menuBarColorsMatch(standard.trackColor, NSColor.gray.withAlphaComponent(0.4)),
+              !standard.isTemplate,
+              standard.usesStatusColors else {
+            return report(name, slug, false, "(the default style changed the original look)")
+        }
+
+        // A stored custom color only applies to the Custom style.
+        let colorStyle = MenuBarIconAppearance.resolve(style: .color, syncingHex: "#FFFFFF", idleHex: "#FFFFFF")
+        guard menuBarColorsMatch(colorStyle.syncingColor, .systemBlue),
+              menuBarColorsMatch(colorStyle.idleColor, .gray) else {
+            return report(name, slug, false, "(Color style used a stored custom color)")
+        }
+
+        // Monochrome: a template image, no status colors, the track fainter than the ring.
+        let mono = MenuBarIconAppearance.resolve(style: .monochrome, syncingHex: "#FF0000", idleHex: "#00FF00")
+        guard mono.isTemplate,
+              !mono.usesStatusColors,
+              mono.syncingColor.alphaComponent == 1,
+              mono.idleColor.alphaComponent == 1,
+              mono.trackColor.alphaComponent < mono.syncingColor.alphaComponent else {
+            return report(name, slug, false, "(Monochrome isn't an opaque template ring with a fainter track)")
+        }
+
+        // Custom: the picked colors, and a track derived from the syncing color.
+        let custom = MenuBarIconAppearance.resolve(style: .custom, syncingHex: "#ffd60a", idleHex: "#FFFFFF")
+        guard !custom.isTemplate,
+              custom.usesStatusColors,
+              menuBarRGBA(custom.syncingColor) == [255, 214, 10, 255],
+              menuBarRGBA(custom.idleColor) == [255, 255, 255, 255],
+              menuBarRGBA(custom.trackColor) == [255, 214, 10, 102] else {
+            return report(name, slug, false, "(Custom didn't use the picked colors: \(String(describing: menuBarRGBA(custom.syncingColor))))")
+        }
+
+        // Custom with an unset or malformed color falls back to the defaults.
+        let fallback = MenuBarIconAppearance.resolve(style: .custom, syncingHex: "", idleHex: "not-a-color")
+        guard menuBarColorsMatch(fallback.syncingColor, .systemBlue),
+              menuBarColorsMatch(fallback.idleColor, .gray) else {
+            return report(name, slug, false, "(Custom didn't fall back to the default colors)")
+        }
+
+        // Hex parsing: what's accepted and what isn't.
+        for accepted in ["#0A84FF", "0a84ff", "  #0A84FF\n"] {
+            guard menuBarRGBA(MenuBarIconAppearance.color(fromHex: accepted)) == [10, 132, 255, 255] else {
+                return report(name, slug, false, "(rejected \(accepted.debugDescription))")
+            }
+        }
+        for rejected in ["", "#", "#FFF", "#GGGGGG", "#0A84FF00", "+0A84F", "#-A84FF", "##0A84F"] {
+            guard MenuBarIconAppearance.color(fromHex: rejected) == nil else {
+                return report(name, slug, false, "(accepted \(rejected.debugDescription))")
+            }
+        }
+
+        // Formatting: sRGB, uppercase, opacity dropped, and a stable round trip.
+        guard MenuBarIconAppearance.hexString(from: NSColor(srgbRed: 1, green: 0.5, blue: 0, alpha: 0.3)) == "#FF8000" else {
+            return report(name, slug, false, "(hexString didn't format #FF8000)")
+        }
+        for hex in ["#000000", "#FFFFFF", "#0A84FF", "#FFD60A"] {
+            guard let parsed = MenuBarIconAppearance.color(fromHex: hex),
+                  MenuBarIconAppearance.hexString(from: parsed) == hex else {
+                return report(name, slug, false, "(\(hex) didn't round-trip)")
+            }
+        }
+
+        // Stored values.
+        guard MenuBarIconStyle.allCases.map(\.rawValue) == ["color", "monochrome", "custom"],
+              MenuBarIconStyle(rawValue: "neon") == nil,
+              MenuBarIconAppearance.styleKey == "menuBarIconStyle",
+              MenuBarIconAppearance.syncingColorKey == "menuBarIconSyncingColor",
+              MenuBarIconAppearance.idleColorKey == "menuBarIconIdleColor" else {
+            return report(name, slug, false, "(stored style values or keys changed)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-MB2 — the menu bar icon is drawn the way the appearance says
+
+    /// The drawn ring: the template flag (which decides whether the menu bar keeps the
+    /// drawn colors or draws the ring in its own text color), the color actually drawn
+    /// (so a hard-coded color can't return), the VoiceOver label, and the wiring from
+    /// the stored preference to the menu bar label and the settings screen.
+    private static func testMenuBarIconRendering() -> Bool {
+        let name = "AC-MB2", slug = "menu-bar-icon-rendering"
+
+        for style in MenuBarIconStyle.allCases {
+            let appearance = MenuBarIconAppearance.resolve(style: style, syncingHex: "#FFD60A", idleHex: "")
+            let image = CircularProgressIcon.makeImage(
+                percentage: 40, color: appearance.syncingColor,
+                trackColor: appearance.trackColor, isTemplate: appearance.isTemplate
+            )
+            guard image.isTemplate == (style == .monochrome) else {
+                return report(name, slug, false, "(\(style.rawValue): image isTemplate=\(image.isTemplate))")
+            }
+        }
+
+        // Pixels: (7, 1) sits on the arc just past its start at the top; (1, 7) on the
+        // left, which a 40% arc doesn't reach, so only the track is drawn there.
+        let custom = MenuBarIconAppearance.resolve(style: .custom, syncingHex: "#FFD60A", idleHex: "")
+        guard let customPixels = menuBarIconPixels(custom, percentage: 40),
+              let arc = customPixels.arc, let track = customPixels.track,
+              arc.redComponent > 0.75, arc.blueComponent < 0.35, arc.alphaComponent > 0.8,
+              track.alphaComponent > 0.15, track.alphaComponent < 0.65 else {
+            return report(name, slug, false, "(Custom ring wasn't drawn in the picked color)")
+        }
+        guard let standardPixels = menuBarIconPixels(.standard, percentage: 40),
+              let standardArc = standardPixels.arc,
+              standardArc.blueComponent > 0.7, standardArc.redComponent < 0.3 else {
+            return report(name, slug, false, "(default ring isn't blue)")
+        }
+
+        // VoiceOver.
+        let labels: [(SyncState, Double?, String)] = [
+            (.syncing, 41.6, "SyncTray, syncing 42 percent"),
+            (.syncing, 140, "SyncTray, syncing 100 percent"),
+            (.syncing, nil, "SyncTray, syncing"),
+            (.syncing, Double.nan, "SyncTray, syncing"),
+            (.idle, nil, "SyncTray, up to date"),
+            (.paused, nil, "SyncTray, paused"),
+            (.error("rclone exited 1"), nil, "SyncTray, sync error"),
+            (.driveNotMounted, nil, "SyncTray, drive not connected"),
+            (.notConfigured, nil, "SyncTray, setup required"),
+        ]
+        for (state, progress, expected) in labels {
+            let label = MenuBarIcon.voiceOverLabel(for: state, progress: progress)
+            guard label == expected else {
+                return report(name, slug, false, "(VoiceOver label \(label.debugDescription), expected \(expected.debugDescription))")
+            }
+        }
+
+        // Wiring: the menu bar label and the settings screen read the same keys, and the
+        // label no longer hard-codes the ring's colors.
+        guard let app = readSourceFile("SyncTrayApp.swift"),
+              let settings = readSourceFile("Views/AppSettingsView.swift") else {
+            return report(name, slug, false, "(couldn't read SyncTrayApp.swift / AppSettingsView.swift)")
+        }
+        let keys = ["@AppStorage(MenuBarIconAppearance.styleKey)",
+                    "@AppStorage(MenuBarIconAppearance.syncingColorKey)",
+                    "@AppStorage(MenuBarIconAppearance.idleColorKey)"]
+        guard keys.allSatisfy({ app.contains($0) && settings.contains($0) }),
+              app.contains("appearance: MenuBarIconAppearance.resolve("),
+              !app.contains("color: .systemBlue)"),
+              !app.contains("color: .gray)"),
+              app.contains("image.isTemplate = isTemplate") else {
+            return report(name, slug, false, "(menu bar icon isn't wired to the stored appearance)")
+        }
+        return report(name, slug, true)
+    }
+
+    /// sRGB components as 0–255 integers, or nil.
+    private static func menuBarRGBA(_ color: NSColor?) -> [Int]? {
+        guard let srgb = color?.usingColorSpace(.sRGB) else { return nil }
+        return [srgb.redComponent, srgb.greenComponent, srgb.blueComponent, srgb.alphaComponent]
+            .map { Int(($0 * 255).rounded()) }
+    }
+
+    /// Equal colors, or the same within one step per channel in sRGB.
+    private static func menuBarColorsMatch(_ a: NSColor, _ b: NSColor) -> Bool {
+        if a == b { return true }
+        guard let x = menuBarRGBA(a), let y = menuBarRGBA(b) else { return false }
+        return zip(x, y).allSatisfy { abs($0 - $1) <= 1 }
+    }
+
+    /// Draws the 14-pt ring into a 14×14 bitmap and returns two pixels: one on the arc
+    /// near its start at the top, and one on the left of the track.
+    private static func menuBarIconPixels(
+        _ appearance: MenuBarIconAppearance, percentage: Double
+    ) -> (arc: NSColor?, track: NSColor?)? {
+        let image = CircularProgressIcon.makeImage(
+            percentage: percentage, color: appearance.syncingColor,
+            trackColor: appearance.trackColor, isTemplate: appearance.isTemplate
+        )
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: 14, pixelsHigh: 14,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .calibratedRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ), let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        image.draw(in: NSRect(x: 0, y: 0, width: 14, height: 14))
+        context.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        // colorAt's y counts from the top row.
+        return (rep.colorAt(x: 7, y: 1)?.usingColorSpace(.sRGB),
+                rep.colorAt(x: 1, y: 7)?.usingColorSpace(.sRGB))
+    }
+}
+
+/// SplitMix64 — a tiny seedable generator so AC-DR1 can check that report codes are
+/// deterministic for a given seed.
+private struct DiagnosticSelfTestRNG: RandomNumberGenerator {
+    var state: UInt64
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
     }
 }
 

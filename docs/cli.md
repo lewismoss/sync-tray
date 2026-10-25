@@ -42,14 +42,17 @@ These commands are read-only.
 | `synctray profiles`                        | One line per profile: name, short id, mode, `enabled=`, `remote=`. `profile list` is an alias.         |
 | `synctray profile show <name\|id>`         | The profile's full config as pretty JSON — the same shape as its `.profile.json`.                      |
 | `synctray logs <name\|id> [--follow]`      | Print the profile's sync log, or follow it like `tail -f`.                                             |
-| `synctray test-remote <name\|id>`          | Probe the profile's remote path with a hard timeout.                                                   |
+| `synctray test-remote <name\|id>`          | Probe the profile's remote path with a hard timeout. A path that doesn't exist yet prints `(path not found)`. |
 | `synctray listremotes`                     | Pass-through to `rclone listremotes`.                                                                  |
+| `synctray settings [show] [--json]`        | The value the app uses for every app-wide setting (the same keys as `settings.json`), as `key=value` lines or a JSON object. |
+| `synctray settings get <key>`              | One app-wide setting's value.                                                                          |
 | `synctray help`                            | Print the usage summary.                                                                               |
 
 ### `doctor`
 
 Prints one `[ok]`, `[warn]`, or `[fail]` line per check and exits `1` if any check failed.
 Warnings never fail the run.
+A remote that answers but has no folder at the profile's path is a warning (`remote reachable, but path not found: <path>`): normal before a Two-Way profile's first sync, and otherwise a sign of a typo in the remote path.
 
 ```console
 $ synctray doctor
@@ -129,6 +132,7 @@ If the app is running, it sees the same file change and ends up in the same stat
 | `synctray profile delete <name\|id>`                     | Remove the agent (unmounting first for Stream) and delete the profile file.          |
 | `synctray install <name\|id>`                            | Install an enabled profile's agent again, for example after it went missing. Never changes `isEnabled`. |
 | `synctray reinstall <name\|id>`                          | Regenerate the script and launchd plist and reinstall the agent. Remounts a mounted Stream profile. |
+| `synctray settings set <key> <value> [...]`              | Change app-wide settings (see [`settings set`](#settings-set)). A running app applies them live. |
 
 ### `profile create`
 
@@ -162,6 +166,22 @@ A `vfsCachePath` change only re-points the cache — use `cache move` to bring t
 Use `profile enable` and `profile disable` for `isEnabled`.
 `id` can't be changed.
 
+### `settings set`
+
+Takes one or more `key value` pairs, the keys of [Configuration files → `settings.json`](configuration.md#settingsjson).
+Every value is validated first, so an unknown key or a bad value exits `65` and changes nothing.
+
+```console
+$ synctray settings set menuBarIconStyle custom menuBarIconIdleColor '#FF9500'
+menuBarIconStyle=custom
+menuBarIconIdleColor=#FF9500
+```
+
+Booleans accept `true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`.
+Colors are `#RRGGBB` (the `#` is optional); `''` goes back to the default color.
+The change is saved where the app reads it and in `settings.json`, so it applies whether or not the app is running.
+`launchAtLogin` registers or removes the login item right away.
+
 ## Operate
 
 | Command                                                         | What it does                                                                 |
@@ -174,6 +194,29 @@ Use `profile enable` and `profile disable` for `isEnabled`.
 - `sync` runs exactly what the app's **Sync Now** runs, guarded by the same lock as scheduled runs. It refuses Stream profiles.
 - `mount` exits `0` once the volume is attached, or right away if it already is. On timeout it tells you whether rclone is still starting — resume with `status <name> --wait mounted` — or never came up. If rclone isn't running for 60 seconds in a row, it fails early and prints the end of the sync log.
 - `cache move` refuses while files in Cache Only are still waiting to upload. When another profile shares the same cached files, it refuses unless you pass `--include-overlapping` to move both.
+
+## Support
+
+| Command                                                          | What it does                                                                 |
+| ---------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `synctray report [name\|id] [--lines N] [--output <path>]`       | Build a diagnostic report for one profile, or all of them, and print it — or save it to `<path>` and print the path. Nothing is sent. |
+| `synctray report [name\|id] --send [--yes] [--json]`             | Send the report to the SyncTray developer and print its code, `Report code: ST-XXXXXX` (or `{"code":"ST-XXXXXX"}` with `--json`). |
+
+A report holds the last `--lines` lines of each profile's sync log (default 500), the profile's `.profile.json` and filter file, its lock files and whether their holders are running, its `synctray-sync.sh` and rclone processes, its SyncTray launchd agents, the output of `status --json` and `doctor`, and the SyncTray, rclone, and macOS versions.
+Unlike usage data, it can contain file and folder names, paths in your home folder (including your username), remote names, and full error messages.
+SyncTray replaces the passwords, tokens, and other secrets it recognizes with `[REDACTED]` before anything is printed, saved, or sent, and `rclone.conf`, `~/.config/synctray/.env`, and the mount's RC API secrets are never read.
+If usage data is on, the report is linked to SyncTray's anonymous install and device IDs; with it off, it carries neither.
+A saved copy (`--output`) is created readable only by you.
+
+- Without `--send`, the report goes to stdout (or to `--output`) and stderr says `Nothing was sent.`
+- `--send` prints the disclosure on stderr, then asks `Send this report? [y/N]` — anything but `y` or `yes`, or end of input, sends nothing.
+  `--yes` (or `-y`) skips the question.
+  When stdin or stderr isn't a terminal, or the `CI` environment variable is set, `--send` without `--yes` refuses with exit code `64`, so a script never sends a report by accident.
+- `--send --output <path>` saves a copy to `<path>` first, then sends.
+- The report lists only the sync script and rclone processes and the launchd agents of the profiles it covers, never another profile's or your own unrelated rclone jobs.
+- Sending doesn't depend on the usage-data setting: it works with usage data off.
+  Builds without an upload endpoint fail with "Diagnostic upload isn't configured in this build" — save the report with `--output` and send the file instead.
+- Give the developer the `ST-XXXXXX` code so they can find your report.
 
 ## Exit codes
 
@@ -191,6 +234,7 @@ Use `profile enable` and `profile disable` for `isEnabled`.
 
 CLI output goes only to your terminal.
 If you've opted in to usage data, each command records its verb, result, exit code, and duration — never its arguments, paths, profile names, or remotes.
+The one exception is `synctray report --send`, which uploads the report you chose to send — see [Support](#support).
 
 ### Periodic backups without syncing on file changes
 

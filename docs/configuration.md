@@ -8,7 +8,7 @@ They are the source of truth: edit one, and the running app applies the change w
 | Path                                         | Contents                                                              | Edit it? |
 | -------------------------------------------- | --------------------------------------------------------------------- | -------- |
 | `profiles/{shortId}.profile.json`            | One profile: folders, remote, mode, schedule, and every setting       | Yes      |
-| `settings.json`                              | App settings: launch at login, usage data, debug logging, auto-fix    | Yes      |
+| `settings.json`                              | App settings: launch at login, usage data, debug logging, auto-fix, menu bar icon | Yes      |
 | `schema/profile.schema.json`                 | JSON Schema for profile files                                         | No — rewritten at every launch |
 | `schema/settings.schema.json`                | JSON Schema for `settings.json`                                       | No — rewritten at every launch |
 | `profiles/{shortId}.json`                    | A subset of the profile, generated for the sync script                | No — generated |
@@ -108,6 +108,14 @@ The schema is authoritative: when this table and [`profile.schema.json`](../Sync
 | `telemetryEnabled`     | Share pseudonymous usage data (off until you opt in)                |
 | `autoFixSyncIssues`    | Run a safe resync by itself when two-way sync reports it's out of sync (on by default) |
 | `debugLoggingEnabled`  | Write verbose debug lines to the sync logs                          |
+| `menuBarIconStyle`     | How the menu bar icon is drawn: `color` (default), `monochrome` (the menu bar's own text color, easiest to see), or `custom` |
+| `menuBarIconSyncingColor` | The `custom` style's ring color while syncing, as `#RRGGBB`; `""` for the default blue |
+| `menuBarIconIdleColor` | The `custom` style's ring color when idle, as `#RRGGBB`; `""` for the default gray |
+
+An invalid value is ignored and the setting keeps its current value.
+An edit made while the app isn't running is applied at its next launch. Launch applies only the keys changed outside the app since it last wrote the file, so a change made in the app without a file write (such as turning on usage data from the banner) is never reverted. It never applies `launchAtLogin`, so a stale file can't undo a change made in System Settings.
+While the app is running, an edit applies right away, and likewise only the keys you changed, so a stale value in the file never reverts a change made in the app.
+`synctray settings set <key> <value>` changes the same settings from the terminal.
 
 ## Files SyncTray creates
 
