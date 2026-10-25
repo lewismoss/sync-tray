@@ -55,6 +55,7 @@ enum ConfigSelfTest {
             testBandwidthLimit,
             testSyncScheduleConfiguration,
             testSyncScheduleScript,
+            testSyncScheduleWiring,
             testMountResilient,
             testWarmSkipsCachedFiles,
             testMountMonitorAutoWarm,
@@ -745,7 +746,7 @@ enum ConfigSelfTest {
             guard let data = SyncSetupService.shared.generateLaunchdPlist(for: p).data(using: .utf8) else { return nil }
             return (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any]
         }
-        guard plist(profile)?["StartInterval"] as? Int == 60 else {
+        guard plist(profile)?["StartInterval"] as? Int == 900 else {
             return report(name, slug, false, "(schedule-only agent does not poll due time)")
         }
         profile.syncOnLocalChanges = true
@@ -821,7 +822,7 @@ enum ConfigSelfTest {
             }
             func calls() -> String { (try? String(contentsOfFile: callsPath, encoding: .utf8)) ?? "" }
             func clearCalls() { try? fm.removeItem(atPath: callsPath) }
-            func run(manual: Bool = false, fail: Bool = false, dry: Bool = false) throws -> Int32 {
+            func launch(manual: Bool = false, fail: Bool = false, dry: Bool = false) throws -> (Process, Pipe) {
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: "/bin/bash")
                 proc.arguments = [scriptPath, configPath] + (manual ? ["--manual"] : [])
@@ -834,19 +835,31 @@ enum ConfigSelfTest {
                 proc.standardOutput = pipe
                 proc.standardError = pipe
                 try proc.run()
-                _ = pipe.fileHandleForReading.readDataToEndOfFile()
-                proc.waitUntilExit()
-                return proc.terminationStatus
+                return (proc, pipe)
+            }
+            func finish(_ running: (Process, Pipe)) -> Int32 {
+                _ = running.1.fileHandleForReading.readDataToEndOfFile()
+                running.0.waitUntilExit()
+                return running.0.terminationStatus
+            }
+            func run(manual: Bool = false, fail: Bool = false, dry: Bool = false) throws -> Int32 {
+                finish(try launch(manual: manual, fail: fail, dry: dry))
             }
             try saveConfig()
-            guard try run() == 0, calls().isEmpty, stateTime() == now,
-                  !fm.fileExists(atPath: profile.localSyncPath) else {
-                return report(name, slug, false, "(no-history load did I/O instead of seeding)")
+            guard try run() == 0, calls().contains("sync "), stateTime() == now else {
+                return report(name, slug, false, "(no-history initial sync did not run)")
             }
+            clearCalls()
             try saveState(now - interval + 1)
-            guard try run() == 0, calls().isEmpty, stateTime() == now - interval + 1 else {
+            // An idle check must not even inspect/refuse the live run lock.
+            try String(getpid()).write(toFile: lockPath, atomically: true, encoding: .utf8)
+            let beforeIdle = (try? String(contentsOfFile: "\(dir)/sync.log", encoding: .utf8)) ?? ""
+            guard try run() == 0, calls().isEmpty, stateTime() == now - interval + 1,
+                  (try String(contentsOfFile: "\(dir)/sync.log", encoding: .utf8)) == beforeIdle,
+                  fm.fileExists(atPath: lockPath) else {
                 return report(name, slug, false, "(ran before one full interval or moved the due time)")
             }
+            try fm.removeItem(atPath: lockPath)
             try saveState(now - interval)
             guard try run() == 0, calls().contains("sync "), stateTime() == now else {
                 return report(name, slug, false, "(did not run exactly when due)")
@@ -868,18 +881,60 @@ enum ConfigSelfTest {
             guard try run() == 0, calls().isEmpty else {
                 return report(name, slug, false, "(failed attempt retried before due)")
             }
+            // Reproduce the wizard/deferred-agent overlap: one idle check and
+            // one manual run, including the maintainer's 25ms stagger. Idle checks
+            // never take the run lock, so none of the 20 manual runs may be lost.
+            for trial in 0..<20 {
+                try saveState(now)
+                clearCalls()
+                let idle = try launch()
+                if trial % 2 == 1 { Thread.sleep(forTimeInterval: 0.025) }
+                let manual = try launch(manual: true)
+                let idleExit = finish(idle), manualExit = finish(manual)
+                guard idleExit == 0, manualExit == 0,
+                      calls().split(separator: "\n").filter({ $0.hasPrefix("sync ") }).count == 1 else {
+                    return report(name, slug, false, "(idle check lost manual sync in trial \(trial))")
+                }
+            }
+            // Two genuinely overdue checks still produce exactly one real sync.
+            for trial in 0..<10 {
+                try saveState(now - interval)
+                clearCalls()
+                let first = try launch(), second = try launch()
+                let firstExit = finish(first), secondExit = finish(second)
+                guard firstExit == 0, secondExit == 0,
+                      calls().split(separator: "\n").filter({ $0.hasPrefix("sync ") }).count == 1 else {
+                    return report(name, slug, false, "(concurrent overdue checks synced twice in trial \(trial))")
+                }
+            }
+            clearCalls()
             try saveState(now + interval)
-            guard try run() == 0, calls().isEmpty, stateTime() == now + interval else {
-                return report(name, slug, false, "(backward clock allowed an early run)")
+            guard try run() == 0, calls().isEmpty, stateTime() == now,
+                  try run() == 0, stateTime() == now else {
+                return report(name, slug, false, "(future timestamp was not clamped durably)")
             }
+            // Once a full interval passes, the corrected timestamp is actually due.
+            try script.replacingOccurrences(of: "now = \(now)", with: "now = \(now + interval)")
+                .write(toFile: scriptPath, atomically: true, encoding: .utf8)
+            guard try run() == 0, calls().contains("sync "), stateTime() == now + interval else {
+                return report(name, slug, false, "(clock correction postponed more than one interval)")
+            }
+            try script.write(toFile: scriptPath, atomically: true, encoding: .utf8)
+            clearCalls()
             try saveState(now - interval * 3, identity: ["different folders"])
-            guard try run() == 0, calls().isEmpty, stateTime() == now else {
-                return report(name, slug, false, "(changed folder identity reused stale cadence)")
+            guard try run() == 0, calls().contains("sync "), stateTime() == now else {
+                return report(name, slug, false, "(changed folder identity did not sync initially)")
             }
+            clearCalls()
             try "broken".write(toFile: statePath, atomically: true, encoding: .utf8)
-            guard try run() == 0, calls().isEmpty, stateTime() == now else {
-                return report(name, slug, false, "(corrupt state triggered an early upload)")
+            guard try run() != 0, calls().isEmpty,
+                  (try String(contentsOfFile: "\(dir)/sync.log", encoding: .utf8)).contains("schedule history is invalid") else {
+                return report(name, slug, false, "(corrupt history failed without a useful profile error)")
             }
+            guard try run(manual: true) == 0, stateTime() == now else {
+                return report(name, slug, false, "(Sync Now did not repair invalid history)")
+            }
+            clearCalls()
             try saveState(now - interval)
             guard try run(dry: true) == 0, stateTime() == now - interval else {
                 return report(name, slug, false, "(dry run advanced the real cadence)")
@@ -899,8 +954,9 @@ enum ConfigSelfTest {
             config["drivePath"] = ""
             config["scheduleStatePath"] = "\(configPath)/not-a-directory"
             try saveConfig()
-            guard try run() != 0, calls().isEmpty else {
-                return report(name, slug, false, "(unwritable state ran anyway)")
+            guard try run() != 0, calls().isEmpty,
+                  (try String(contentsOfFile: "\(dir)/sync.log", encoding: .utf8)).contains("Schedule check failed:") else {
+                return report(name, slug, false, "(unwritable state ran anyway or failed silently)")
             }
             config["scheduleStatePath"] = statePath
             config["syncOnLocalChanges"] = true
@@ -916,15 +972,124 @@ enum ConfigSelfTest {
             guard try run() == 0, calls().contains("sync ") else {
                 return report(name, slug, false, "(old derived config stopped working)")
             }
+            config["syncOnLocalChanges"] = false
+            config["scheduleStatePath"] = statePath
+            try saveConfig()
             profile.syncOnLocalChanges = false
+            var previous = profile
+            previous.syncOnLocalChanges = true
+            try saveState(now)
+            try SyncSetupService.requestInitialScheduledSync(from: previous, to: profile, statePath: statePath)
+            clearCalls()
+            guard try run() == 0, calls().contains("sync "), stateTime() == now else {
+                return report(name, slug, false, "(switching with recent history did not sync initially)")
+            }
+            clearCalls()
+            guard try run() == 0, calls().isEmpty else {
+                return report(name, slug, false, "(initial sync request was consumed more than once)")
+            }
+            var directionEdit = profile
+            directionEdit.syncDirection = .remoteToLocal
+            guard SyncSetupService.needsInitialScheduledSync(from: profile, to: directionEdit) else {
+                return report(name, slug, false, "(direction change did not request an initial sync)")
+            }
+            var intervalEdit = profile
+            intervalEdit.syncIntervalMinutes *= 2
+            guard !SyncSetupService.needsInitialScheduledSync(from: profile, to: intervalEdit) else {
+                return report(name, slug, false, "(ordinary interval edit requests an extra sync)")
+            }
             try SyncSetupService.recordSyncAttempt(for: profile,
                 at: Date(timeIntervalSince1970: TimeInterval(now)), statePath: statePath)
             guard stateTime() == now,
                   (try fm.attributesOfItem(atPath: statePath)[.posixPermissions] as? Int) == 0o600 else {
                 return report(name, slug, false, "(direct initial-sync cadence/permissions failed)")
             }
+            SyncSetupService.removeScheduleState(for: profile, statePath: statePath)
+            guard !fm.fileExists(atPath: statePath), !fm.fileExists(atPath: statePath + ".request"),
+                  !fm.fileExists(atPath: statePath + ".lock") else {
+                return report(name, slug, false, "(deletion left schedule history behind)")
+            }
         } catch {
             return report(name, slug, false, "(\(error))")
+        }
+        return report(name, slug, true)
+    }
+
+    /// Pins the boundaries that the shell fixture cannot exercise: app/CLI callers,
+    /// file-watcher policy, recovery provenance, and deletion. A parser assertion also
+    /// proves the real script's scheduling error becomes the app's failed-run event.
+    private static func testSyncScheduleWiring() -> Bool {
+        let name = "AC-SC3", slug = "sync-schedule-wiring"
+        guard let manager = readSourceFile("Services/SyncManager.swift"),
+              let manual = extractFunctionBody(startingAt: "private func runSyncScript(", in: manager),
+              let recovery = extractFunctionBody(startingAt: "func triggerAutoFix(", in: manager),
+              let watch = extractFunctionBody(startingAt: "private func startWatchingDirectory(", in: manager),
+              let callback = extractFunctionBody(startingAt: "private func handleDirectoryChange(", in: manager),
+              let allWatchers = extractFunctionBody(startingAt: "private func startWatchingAllProfiles(", in: manager),
+              let exclusive = extractFunctionBody(startingAt: "func beginExclusiveRun(", in: manager),
+              let cli = readSourceFile("CLI/SyncTrayCLI.swift"),
+              let production = extractFunctionBody(startingAt: "static func production()", in: cli),
+              let store = readSourceFile("Services/ProfileStore.swift"),
+              let deletion = extractFunctionBody(startingAt: "func delete(id:", in: store),
+              let wizard = readSourceFile("Views/Wizard/SetupWizardView.swift"),
+              let saveWizard = extractFunctionBody(startingAt: "private func saveProfile()", in: wizard),
+              let editor = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let setup = readSourceFile("Services/SyncSetupService.swift"),
+              let reinstall = extractFunctionBody(startingAt: "func uninstallForReinstall(", in: setup) else {
+            return report(name, slug, false, "(source wiring unavailable)")
+        }
+        guard manual.contains("if trigger == \"manual\" { process.arguments?.append(\"--manual\") }"),
+              manual.contains("defer {"), manual.contains("restoreDeferredAgent && !profile.syncOnLocalChanges"),
+              production.contains("args: [SyncProfile.sharedScriptPath, configPath, \"--manual\"]"),
+              recovery.contains("guard Self.scheduleRecoveryAllowed("),
+              recovery.contains("failureAt: latestScheduleFailureAt[profile.id]"),
+              recovery.contains("autoFixSuppressed.contains(profileId)"),
+              manager.contains("if SyncLogPatterns.isScheduleCheckFailed(event.rawLine)"),
+              exclusive.contains("if source != .autoFix"),
+              watch.contains("guard profile.syncOnLocalChanges"),
+              callback.contains("profile.isEnabled, profile.syncOnLocalChanges"),
+              allWatchers.contains("where !watchedProfileIds.contains(id)"),
+              allWatchers.contains("profile.syncOnLocalChanges"),
+              reinstall.contains("requestInitialScheduledSync(from: old, to: new)"),
+              saveWizard.contains("requestInitialScheduledSync(from: existingProfile, to: updatedProfile)"),
+              !saveWizard.contains("triggerManualSync"),
+              editor.contains("syncOnLocalChanges: updatedProfile.syncOnLocalChanges"),
+              deletion.contains("SyncSetupService.removeScheduleState(for: removed)"),
+              production.contains("SyncSetupService.removeScheduleState(for: profile)") else {
+            return report(name, slug, false, "(manual/recovery/watcher/initial-sync/delete wiring changed)")
+        }
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        guard SyncManager.scheduleRecoveryAllowed(syncOnLocalChanges: false, failureAt: now,
+                    monitoringStartedAt: now.addingTimeInterval(-60), now: now),
+              !SyncManager.scheduleRecoveryAllowed(syncOnLocalChanges: false, failureAt: now.addingTimeInterval(-3600),
+                    monitoringStartedAt: now.addingTimeInterval(-60), now: now),
+              !SyncManager.scheduleRecoveryAllowed(syncOnLocalChanges: false, failureAt: nil,
+                    monitoringStartedAt: now, now: now),
+              !SyncManager.scheduleRecoveryAllowed(syncOnLocalChanges: false, failureAt: now,
+                    monitoringStartedAt: now.addingTimeInterval(-60), now: now.addingTimeInterval(301)),
+              SyncManager.scheduleRecoveryAllowed(syncOnLocalChanges: true, failureAt: nil,
+                    monitoringStartedAt: now, now: now) else {
+            return report(name, slug, false, "(live recovery or historical replay policy failed)")
+        }
+        let message = "Schedule check failed: Permission denied writing schedule history"
+        guard SyncLogPatterns.isSyncFailed(message),
+              let event = LogParser().parse(line: "2033-05-18 03:33:20 - \(message)"),
+              case .syncFailed(let exitCode, let detail) = event.type,
+              exitCode == 1, detail == message else {
+            return report(name, slug, false, "(schedule failure is not a visible failed-run event)")
+        }
+        var profile = sampleProfile()
+        profile.syncIntervalMinutes = 1
+        guard profile.scheduleCheckIntervalSeconds == 60 else {
+            return report(name, slug, false, "(minimum poll interval failed)")
+        }
+        profile.syncIntervalMinutes = 20
+        guard profile.scheduleCheckIntervalSeconds == 300 else {
+            return report(name, slug, false, "(adaptive poll interval failed)")
+        }
+        profile.syncIntervalMinutes = 10_080
+        guard profile.scheduleCheckIntervalSeconds == 900 else {
+            return report(name, slug, false, "(maximum poll interval failed)")
         }
         return report(name, slug, true)
     }
@@ -8746,6 +8911,11 @@ enum ConfigSelfTest {
                 filterChanged: c.filterChanged, needsReinstall: c.needsReinstall,
                 runLive: c.runLive, installed: c.installed
             )
+            guard SyncManager.filterSaveFollowUp(
+                filterChanged: c.filterChanged, needsReinstall: c.needsReinstall,
+                runLive: c.runLive, installed: c.installed, syncOnLocalChanges: false) == .none else {
+                return report(name, slug, false, "(schedule-only filter edit started an extra sync)")
+            }
             guard got == c.expected else {
                 return report(name, slug, false,
                     "(filterChanged=\(c.filterChanged) needsReinstall=\(c.needsReinstall) runLive=\(c.runLive) "

@@ -2190,6 +2190,7 @@ extension CLIEnvironment {
                 catch { return "\(error)" }
             },
             deleteProfileFile: { profile in
+                SyncSetupService.removeScheduleState(for: profile)
                 let path = "\(SyncProfile.configDirectory)/\(profile.shortId).profile.json"
                 try? FileManager.default.removeItem(atPath: path)
                 // Clean up a legacy "(Offline)" browse point too, if the retired feature

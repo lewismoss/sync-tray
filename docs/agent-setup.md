@@ -232,14 +232,7 @@ More fixes are in [Troubleshooting](troubleshooting.md).
 
 ### Daily or weekly backups
 
-For a development folder that should be uploaded only periodically, set
-`syncOnLocalChanges` to `false` and `syncIntervalMinutes` to `1440` (daily),
-`10080` (weekly), or another whole number from 1 to 525600. This avoids uploading
-transient files while editing. Existing profiles default to syncing on local
-changes as well as their schedule.
-
-Schedule-only history persists across app/agent restarts and profile saves.
-Missing history starts a full interval without an automatic first upload.
-Use `synctray sync <profile>` when an immediate initial backup or retry is wanted;
-it overrides the due time and restarts the interval. Failed attempts also restart
-the interval, and schedule-only disables automatic error-recovery runs.
+For periodic backups, set `syncOnLocalChanges` to `false` and choose an interval
+in minutes (for example `10080` for weekly). See [schedule-only configuration](configuration.md#schedule-only-state)
+for first-run, recovery and persistence rules, and the [user guide](user-guide.md#automatic-sync-and-longer-intervals)
+for the settings UI.

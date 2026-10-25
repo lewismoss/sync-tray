@@ -230,20 +230,18 @@ A saved copy (`--output`) is created readable only by you.
 
 `sync` returns the sync script's own exit code.
 
-## Privacy
-
-CLI output goes only to your terminal.
-If you've opted in to usage data, each command records its verb, result, exit code, and duration — never its arguments, paths, profile names, or remotes.
-The one exception is `synctray report --send`, which uploads the report you chose to send — see [Support](#support).
-
-### Periodic backups without syncing on file changes
+## Periodic backups
 
 ```bash
 synctray profile set Projects syncOnLocalChanges false syncIntervalMinutes 10080
 ```
 
-This sets schedule-only syncing every seven days. `syncOnLocalChanges` defaults
-to `true`; `syncIntervalMinutes` accepts 1–525600 minutes. Daily is 1440 minutes,
-weekly is 10080 and every two weeks is 20160. `synctray sync Projects` explicitly
-bypasses the due-time check and restarts the interval. Failed scheduled attempts
-also restart it; automatic recovery does not run between attempts in this mode.
+This selects weekly schedule-only backups. See [schedule-only configuration](configuration.md#schedule-only-state)
+for first-run/recovery semantics and the [user guide](user-guide.md#automatic-sync-and-longer-intervals)
+for behavior across sleep and restarts.
+
+## Privacy
+
+CLI output goes only to your terminal.
+If you've opted in to usage data, each command records its verb, result, exit code, and duration — never its arguments, paths, profile names, or remotes.
+The one exception is `synctray report --send`, which uploads the report you chose to send — see [Support](#support).

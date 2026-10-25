@@ -525,7 +525,7 @@ struct SetupWizardView: View {
                         LabeledContent("Automatic Sync", value: syncOnLocalChanges ? "On local changes + schedule" : "Schedule only")
                         LabeledContent("Interval", value: SyncScheduleInterval.label(for: syncInterval))
                         Text(isEditMode
-                             ? "Saving keeps the scheduled interval. Sync Now is available for an immediate sync."
+                             ? "Switching to Schedule only or changing sync folders starts one sync immediately."
                              : "The initial sync runs immediately during setup. This interval applies to subsequent automatic syncs.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -946,6 +946,13 @@ struct SetupWizardView: View {
             updatedProfile.syncMode = syncMode
             updatedProfile.syncDirection = syncDirection
 
+            do {
+                try SyncSetupService.requestInitialScheduledSync(from: existingProfile, to: updatedProfile)
+            } catch {
+                errorMessage = "Could not update the sync schedule: \(error.localizedDescription)"
+                isLoading = false
+                return
+            }
             profileStore.update(updatedProfile)
             profileToInstall = updatedProfile
         } else {
@@ -981,9 +988,8 @@ struct SetupWizardView: View {
                 profileToInstall.isEnabled = true
                 profileStore.update(profileToInstall)
                 syncManager.refreshSettings()
-                // Creating a profile explicitly requests its initial sync. Later
-                // loads/saves go through the durable schedule-only due-time gate.
-                syncManager.triggerManualSync(for: profileToInstall)
+                // RunAtLoad starts the initial attempt. Do not launch a second
+                // manual process next to that same initial run.
             }
         } catch {
             print("Failed to install scheduled sync: \(error)")

@@ -93,7 +93,7 @@ struct SyncScheduleControls: View {
             }
             Text(syncOnLocalChanges
                  ? "Local changes also trigger a sync after a short delay."
-                 : "Files and the remote are checked only when the interval is due. Sync Now runs immediately and restarts the interval. Failed attempts also restart the interval.")
+                 : "Switching to Schedule only syncs once immediately, then waits for the interval. Sync Now restarts the interval. Failed attempts may run automatic repair.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

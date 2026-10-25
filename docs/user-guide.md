@@ -42,31 +42,37 @@ Choose a preset up to **2 weeks**, or **Custom…** with a whole number of minut
 hours, days or weeks (1 minute to 365 days). These are elapsed intervals: one week
 means seven days, rather than a specific weekday or clock time.
 
-Schedule only remembers the last attempt across app launches, login, restarts and
-settings saves. **Sync Now**, the CLI `sync` command and an initial sync during
-setup run immediately and restart the interval. Failed attempts also restart it;
-use Sync Now to retry sooner. Automatic error recovery is disabled for this mode
-so it cannot cause extra uploads between scheduled attempts.
+Creating a schedule-only profile, switching an existing profile to Schedule only,
+or changing its folders/direction starts one sync immediately. After that, the
+interval runs from each attempt's start. Ordinary saves, login, restart and
+interval edits keep the saved attempt time. **Sync Now** runs immediately and
+restarts the interval. Exclusion-pattern edits take effect on the next scheduled
+or manual run, without starting a sync merely because you saved them.
 
-The background agent checks the saved due time locally once a minute, without
-scanning your folder or contacting the remote before it is due. If the Mac is
-asleep/off, or the configured external drive is disconnected, an overdue sync
-runs once after it is available, normally within a minute; missed intervals do
-not queue multiple runs. It never wakes the Mac. Network failures count as an
-attempt and wait until the next interval, unless you retry manually.
+Failed attempts also start the interval. If a two-way run needs repair, the app
+can run its usual bounded auto-fix immediately as part of that same attempt,
+respecting the global Auto-fix setting and backoff. It never repairs an old failure
+just because you reopened the app. Other failures wait until the next interval;
+use Sync Now to retry sooner.
 
-Without usable schedule history (including when folders or direction change),
-the first automatic check starts a full interval rather than uploading at login
-or on Save. Moving the clock backwards waits until the recorded attempt plus
-the interval is due again. Changing the interval applies it to the saved attempt
-time; it does not reset that time.
+The background agent checks eligibility locally every quarter interval, bounded
+between **1 and 15 minutes**. Weekly profiles check every 15 minutes. An idle check
+loads configuration once, without scanning files, contacting the remote or taking
+the sync run lock. It never wakes the Mac. After sleep, restart or reconnecting an
+external drive, one overdue sync runs on the next check (up to 15 minutes later);
+missed intervals never queue multiple runs. A disconnected drive does not consume
+an attempt; network failures do.
+
+A future attempt time caused by correcting the clock is reset to now, so it delays
+at most one interval. Missing history or changed folders starts an initial sync;
+invalid or unwritable history shows an error in the profile, including the reason.
+Sync Now can rebuild corrupt history after a storage/permission issue is resolved.
 
 ## Two-way sync
 
 For files you edit in more than one place.
 SyncTray runs `rclone bisync` on your schedule, from every 1 minute to every 365 days (5 minutes by default).
-
-
+With **On local changes + schedule**, local changes also trigger a sync about five seconds after editing stops while the app is open.
 
 - **Conflicts keep both copies.** When a file changed on both sides, the newer version keeps the name and the other is renamed with a `sync-conflict-<date>` suffix.
 - **Mass deletions stop.** If a run would delete more than half of the files, it stops instead. The profile shows **Delete from Remote** to go ahead, or **Restore from Remote** to bring the files back.

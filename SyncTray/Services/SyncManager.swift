@@ -491,6 +491,8 @@ final class SyncManager: ObservableObject {
     /// Cleared when a run starts or succeeds.
     private var lastHandledSyncFailureAt: [UUID: Date] = [:]
     private var lastSyncFailureAutoFix: [UUID: AutoFixOutcome] = [:]
+    private let scheduleRecoveryMonitoringStartedAt = Date()
+    private var latestScheduleFailureAt: [UUID: Date] = [:]
 
     /// An auto-fix resync that succeeds while the next bisync fails the same way again (#123,
     /// `AutoFixRecurrence`). A normal (non-auto-fix) success clears all of these.
@@ -1463,7 +1465,7 @@ final class SyncManager: ObservableObject {
         if source != .autoFix {
             let current = profileStore.profile(for: profile.id) ?? profile
             do { try SyncSetupService.recordSyncAttempt(for: current) }
-            catch { SyncTraySettings.debugLog("Could not record sync attempt: \(error)") }
+            catch { SyncSetupService.recordScheduleError(for: current, error: error) }
         }
         return token
     }
@@ -1628,6 +1630,18 @@ final class SyncManager: ObservableObject {
             .store(in: &cancellables)
     }
 
+    /// Recovery belongs to the live failing attempt, never to a failure replayed
+    /// from an earlier app session. The normal auto-fix backoff/recurrence guards
+    /// still bound the repair itself. Log timestamps have one-second precision.
+    nonisolated static func scheduleRecoveryAllowed(syncOnLocalChanges: Bool, failureAt: Date?,
+                                                    monitoringStartedAt: Date, now: Date) -> Bool {
+        if syncOnLocalChanges { return true }
+        guard let failureAt else { return false }
+        let sessionStart = Date(timeIntervalSince1970: floor(monitoringStartedAt.timeIntervalSince1970))
+        return failureAt >= sessionStart && now.timeIntervalSince(failureAt) >= -2
+            && now.timeIntervalSince(failureAt) <= 300
+    }
+
     // MARK: - Auto-Fix
 
     /// What `processLogEvent` does with a genuine `.syncFailed` (one that is not an aborted
@@ -1687,6 +1701,9 @@ final class SyncManager: ObservableObject {
     /// view is driven by the profile state change visible via `@Published profileStates`).
     @discardableResult
     func triggerAutoFix(for profile: SyncProfile) -> AutoFixOutcome {
+        guard Self.scheduleRecoveryAllowed(
+            syncOnLocalChanges: profile.syncOnLocalChanges, failureAt: latestScheduleFailureAt[profile.id],
+            monitoringStartedAt: scheduleRecoveryMonitoringStartedAt, now: Date()) else { return .notApplicable }
         let profileId = profile.id
 
         // Respect the global setting
@@ -3167,14 +3184,17 @@ final class SyncManager: ObservableObject {
         // A new run, started after the abort finished: its failures are its own again.
         abortSuppressUntil[profile.id] = nil
 
-        if agentLoadDeferredByAbort.remove(profile.id) != nil, !setupService.isLoaded(profile: profile) {
-            if setupService.loadAgent(for: profile) {
-                SyncTraySettings.debugLog("Restarted '\(profile.name)' by loading its launchd agent (deferred by an abort)")
-                if profile.syncOnLocalChanges { return }
-                // Schedule-only loading merely checks whether due; the explicit
-                // Sync Now still needs its manual bypass below.
-            } else {
-                // Could not load it: still run now, and try the load again next time.
+        let restoreDeferredAgent = agentLoadDeferredByAbort.remove(profile.id) != nil
+            && !setupService.isLoaded(profile: profile)
+        if restoreDeferredAgent && profile.syncOnLocalChanges {
+            if setupService.loadAgent(for: profile) { return }
+            agentLoadDeferredByAbort.insert(profile.id)
+        }
+        // For schedule-only, load AFTER the explicit manual attempt. RunAtLoad
+        // must not start the same due attempt next to its --manual override.
+        defer {
+            if restoreDeferredAgent && !profile.syncOnLocalChanges,
+               !setupService.loadAgent(for: profile) {
                 agentLoadDeferredByAbort.insert(profile.id)
             }
         }
@@ -3372,6 +3392,14 @@ final class SyncManager: ObservableObject {
 
             // A failed bisync reports its end twice (#122). The repeat must not set the error,
             // notify, or record the failure again — see `syncFailureHandling`.
+            if SyncLogPatterns.isScheduleCheckFailed(event.rawLine) {
+                // Eligibility failed before any sync started. Do not mistake an old
+                // out-of-sync error for this failure and launch automatic recovery.
+                latestScheduleFailureAt[profileId] = nil
+                profileErrors[profileId] = message
+            } else {
+                latestScheduleFailureAt[profileId] = event.timestamp
+            }
             let failureHandledAt = Date()
             let handling = Self.syncFailureHandling(
                 lastHandledAt: lastHandledSyncFailureAt[profileId],

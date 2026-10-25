@@ -189,6 +189,11 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         "\(NSHomeDirectory())/.local/state/synctray/schedules/\(shortId).json"
     }
 
+    /// Frequent enough to catch up after sleep, without waking a weekly profile every minute.
+    var scheduleCheckIntervalSeconds: Int {
+        min(900, max(60, min(max(1, syncIntervalMinutes), Self.maximumSyncIntervalMinutes) * 60 / 4))
+    }
+
     var scheduleIdentity: [String] {
         [fullRemotePath, localSyncPath, syncMode.rawValue, syncDirection.rawValue]
     }

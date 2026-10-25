@@ -2489,7 +2489,8 @@ struct ProfileDetailView: View {
             filterChanged: SyncManager.syncFilterReconcileNeeded(from: currentProfile, to: updatedProfile),
             needsReinstall: needsReinstall,
             runLive: syncManager.isRunLive(for: currentProfile),
-            installed: isInstalled
+            installed: isInstalled,
+            syncOnLocalChanges: updatedProfile.syncOnLocalChanges
         )
 
         // A live run needs confirmation before SyncTray stops it — nothing is persisted until
@@ -3303,8 +3304,8 @@ struct ProfileDetailView: View {
         } catch {
             // Ignore uninstall errors
         }
-        // Saving a schedule-only profile must not force an immediate upload,
-        // even for one-way profiles (which never have bisync listings).
+        // The script consumes a one-time request for a mode/folder change; an
+        // ordinary Save must not start a second initial/resync process.
         installSync(using: overrideProfile, runInitialSync: (overrideProfile ?? currentProfile).syncOnLocalChanges)
     }
 
